@@ -1,81 +1,75 @@
 /* Netflix Ratings Overlay Styles */
 /* Using 'nro-' prefix to avoid conflicts with Netflix's styles */
 
-.nro-ratings-overlay {
-  position: absolute;
-  bottom: 8px;
-  left: 8px;
-  display: flex;
-  gap: 4px;
-  z-index: 1000;
-  opacity: 0;
-  animation: nro-fadeIn 0.2s ease-out forwards;
-  pointer-events: none;
-}
-
-@keyframes nro-fadeIn {
-  to {
-    opacity: 1;
-  }
+/* Floating overlay container */
+#nro-floating-overlay {
+  position: fixed !important;
+  z-index: 999999 !important;
+  pointer-events: none !important;
+  display: flex !important;
+  gap: 4px !important;
 }
 
 .nro-rating-badge {
-  display: flex;
-  align-items: center;
-  gap: 3px;
-  padding: 3px 6px;
-  border-radius: 3px;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-  font-size: 11px;
-  font-weight: 600;
-  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.4);
-  backdrop-filter: blur(4px);
+  display: flex !important;
+  align-items: center !important;
+  gap: 3px !important;
+  padding: 5px 10px !important;
+  border-radius: 4px !important;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif !important;
+  font-size: 13px !important;
+  font-weight: 600 !important;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.6) !important;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
 }
 
 .nro-rating-badge.nro-imdb {
-  background: linear-gradient(135deg, #f5c518 0%, #ddb117 100%);
-  color: #000;
+  background: linear-gradient(135deg, #f5c518 0%, #ddb117 100%) !important;
+  color: #000 !important;
 }
 
 .nro-rating-badge.nro-rt {
-  color: #fff;
+  color: #fff !important;
 }
 
 .nro-rating-badge.nro-rt.nro-fresh {
-  background: linear-gradient(135deg, #fa320a 0%, #d92b08 100%);
+  background: linear-gradient(135deg, #fa320a 0%, #d92b08 100%) !important;
 }
 
 .nro-rating-badge.nro-rt.nro-rotten {
-  background: linear-gradient(135deg, #6c757d 0%, #545b62 100%);
+  background: linear-gradient(135deg, #6c757d 0%, #545b62 100%) !important;
 }
 
 .nro-rating-icon {
-  font-size: 9px;
-  text-transform: uppercase;
-  letter-spacing: 0.3px;
-  opacity: 0.9;
+  font-size: 10px !important;
+  text-transform: uppercase !important;
+  letter-spacing: 0.5px !important;
+  opacity: 0.85 !important;
 }
 
 .nro-rating-value {
-  font-weight: 700;
-  font-size: 12px;
+  font-weight: 700 !important;
+  font-size: 14px !important;
 }
 
 .nro-ratings-loading {
-  padding: 4px 8px;
-  background: rgba(0, 0, 0, 0.75);
-  border-radius: 3px;
-  backdrop-filter: blur(4px);
+  padding: 6px 12px !important;
+  background: rgba(20, 20, 20, 0.9) !important;
+  border-radius: 4px !important;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.6) !important;
 }
 
 .nro-spinner {
-  display: inline-block;
-  width: 12px;
-  height: 12px;
-  border: 2px solid rgba(255, 255, 255, 0.3);
-  border-top-color: #fff;
-  border-radius: 50%;
-  animation: nro-spin 0.7s linear infinite;
+  display: inline-block !important;
+  width: 14px !important;
+  height: 14px !important;
+  border: 2px solid rgba(255, 255, 255, 0.3) !important;
+  border-top-color: #e50914 !important;
+  border-radius: 50% !important;
+  animation: nro-spin 0.7s linear infinite !important;
 }
 
 @keyframes nro-spin {
@@ -85,21 +79,23 @@
 }
 
 .nro-ratings-error {
-  padding: 3px 8px;
-  background: rgba(220, 53, 69, 0.9);
-  color: #fff;
-  border-radius: 3px;
-  font-size: 11px;
-  font-weight: 600;
-  cursor: help;
+  padding: 5px 12px !important;
+  background: rgba(220, 53, 69, 0.95) !important;
+  color: #fff !important;
+  border-radius: 4px !important;
+  font-size: 13px !important;
+  font-weight: 600 !important;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.6) !important;
 }
 
 .nro-ratings-na {
-  padding: 3px 6px;
-  background: rgba(0, 0, 0, 0.75);
-  color: #888;
-  border-radius: 3px;
-  font-size: 10px;
-  font-weight: 500;
-  backdrop-filter: blur(4px);
+  padding: 5px 10px !important;
+  background: rgba(20, 20, 20, 0.9) !important;
+  color: #888 !important;
+  border-radius: 4px !important;
+  font-size: 12px !important;
+  font-weight: 500 !important;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.6) !important;
 }
