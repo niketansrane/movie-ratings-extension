@@ -4,6 +4,10 @@ A Chrome extension that displays IMDb and Rotten Tomatoes ratings when you hover
 
 ![Chrome Extension](https://img.shields.io/badge/Chrome-Extension-green) ![Manifest V3](https://img.shields.io/badge/Manifest-V3-blue)
 
+## Demo
+
+![Movie Ratings Extension Demo](assets/demo.gif)
+
 ## Features
 
 - **IMDb Ratings** - See the IMDb score (e.g., 7.3/10)
