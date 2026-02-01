@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Netflix Ratings</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="popup-container">
+    <header class="header">
+      <h1>Netflix Ratings</h1>
+      <p class="subtitle">IMDb & Rotten Tomatoes on hover</p>
+    </header>
+
+    <div class="section">
+      <label for="apiKey">OMDb API Key</label>
+      <div class="input-group">
+        <input type="password" id="apiKey" placeholder="Enter your API key" autocomplete="off">
+        <button type="button" id="toggleVisibility" class="icon-btn" title="Show/Hide">
+          <svg id="eyeIcon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+            <circle cx="12" cy="12" r="3"></circle>
+          </svg>
+        </button>
+      </div>
+      <a href="https://www.omdbapi.com/apikey.aspx" target="_blank" class="help-link">
+        Get free API key (1000 requests/day)
+      </a>
+    </div>
+
+    <div class="section">
+      <label class="toggle">
+        <input type="checkbox" id="enabled" checked>
+        <span class="slider"></span>
+        <span class="label">Extension enabled</span>
+      </label>
+    </div>
+
+    <div class="section stats">
+      <div class="stat">
+        <span class="stat-value" id="cacheCount">0</span>
+        <span class="stat-label">Cached</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value" id="apiCalls">0</span>
+        <span class="stat-label">API calls today</span>
+      </div>
+    </div>
+
+    <div class="button-group">
+      <button id="clearCache" class="btn secondary">Clear Cache</button>
+      <button id="save" class="btn primary">Save</button>
+    </div>
+
+    <div id="status" class="status"></div>
+
+    <footer class="footer">
+      <p>Hover over movie posters on Netflix to see ratings</p>
+    </footer>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
