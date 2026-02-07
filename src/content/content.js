@@ -1,599 +1,32 @@
-// Content script for Netflix Ratings Overlay
-// Handles DOM interaction, hover events, and overlay display
-
-const DEBOUNCE_MS = 300;
-const HIDE_DELAY_MS = 600;
-const POSITION_UPDATE_MS = 200;
-const DEBUG = false;
-
-let hoverTimeout = null;
-let hideTimeout = null;
-let positionInterval = null;
-let currentHoveredElement = null;
-let currentTitle = null;
-let floatingOverlay = null;
-let lastMouseX = 0;
-let lastMouseY = 0;
-let extensionEnabled = true;
-
-let initialized = false;
-let mutationObserver = null;
-let urlObserver = null;
-let attachScanTimeout = null;
-let attachScanTimeout2 = null;
-let pendingBodyScan = null;
-let requestId = 0; // Monotonically increasing ID to track latest request
-
-function log(...args) {
-  if (DEBUG) console.log('[Netflix Ratings]', ...args);
-}
-
-// ─── Floating overlay (single instance) ───────────────────────
-
-function createFloatingOverlay() {
-  // Check if existing overlay is still in the DOM (SPA navigation can orphan it)
-  if (floatingOverlay && document.body.contains(floatingOverlay)) {
-    return floatingOverlay;
-  }
-
-  // Remove stale reference if orphaned
-  if (floatingOverlay) {
-    floatingOverlay = null;
-  }
-
-  floatingOverlay = document.createElement('div');
-  floatingOverlay.id = 'nro-floating-overlay';
-  floatingOverlay.style.cssText = `
-    position: fixed !important;
-    z-index: 999999 !important;
-    pointer-events: none !important;
-    opacity: 0;
-    transition: opacity 0.15s ease-out;
-    display: flex;
-    gap: 4px;
-  `;
-  document.body.appendChild(floatingOverlay);
-  return floatingOverlay;
-}
-
-// ─── Title & metadata extraction ──────────────────────────────
-
-// Extract comprehensive metadata from the Netflix DOM element to
-// improve OMDb matching accuracy. We gather: title, year, mediaType.
-function extractTitleFromElement(element) {
-  let title = null;
-  let year = null;
-  let mediaType = null; // null = unknown, let service worker figure it out
-
-  // ── Strategy 1: aria-label (richest source — often has year, season info) ──
-  let ariaLabel = element.getAttribute('aria-label');
-  if (!ariaLabel) {
-    const parent = element.closest('[aria-label]');
-    ariaLabel = parent?.getAttribute('aria-label');
-  }
-  if (ariaLabel && ariaLabel.length > 2 && !isNonTitleLabel(ariaLabel)) {
-    log('Found aria-label:', ariaLabel);
-    const parsed = parseAriaLabel(ariaLabel);
-    title = parsed.title;
-    year = parsed.year;
-    mediaType = parsed.mediaType;
-  }
-
-  // ── Strategy 2: Image alt text ──
-  if (!title) {
-    const img = element.querySelector('img[alt]') ||
-                element.closest('.title-card-container, .slider-item')?.querySelector('img[alt]');
-    if (img?.alt && img.alt.length > 2 && !isNonTitleLabel(img.alt)) {
-      log('Found img alt:', img.alt);
-      title = img.alt.trim();
-    }
-  }
-
-  // ── Strategy 3: Netflix-specific title selectors ──
-  // Covers both small poster cards AND the large hero/billboard banner
-  if (!title) {
-    const titleSelectors = [
-      // Hero banner / billboard selectors
-      '.billboard-title .title-logo',
-      '.hero-title .title-logo',
-      '[class*="billboard"] .title-logo',
-      '[class*="hero"] .title-logo',
-      '[class*="billboard"] [class*="title-treatment"]',
-      '[class*="billboard"] [class*="titleTreatment"]',
-      '[class*="billboard-title"]',
-      '[class*="hero-title"]',
-      '.title-treatment',
-      // Small poster card selectors
-      '.fallback-text',
-      '.title-card-title',
-      '.previewModal-player-titleTreatment-logo',
-      '.previewModal-title',
-      '.bob-title',
-    ];
-
-    for (const selector of titleSelectors) {
-      const titleEl = element.querySelector(selector);
-      if (titleEl) {
-        if (titleEl.tagName === 'IMG' && titleEl.alt) {
-          log('Found title via logo alt', selector, ':', titleEl.alt);
-          title = titleEl.alt.trim();
-          break;
-        }
-        const text = titleEl.textContent?.trim();
-        if (text && text.length > 2 && text.length < 100 && !isNonTitleLabel(text)) {
-          log('Found title via selector', selector, ':', text);
-          title = text;
-          break;
-        }
-      }
-    }
-  }
-
-  // ── Strategy 4: Look in preview modal / billboard ancestors ──
-  if (!title) {
-    const roots = getSearchRoots(element);
-    rootSearch:
-    for (const root of roots) {
-      if (root === element) continue; // Already searched element in strategies 1-3
-      const ancestorTitleSelectors = [
-        '.billboard-title .title-logo',
-        '[class*="billboard"] .title-logo',
-        '[class*="billboard"] [class*="title-treatment"]',
-        '[class*="billboard"] [class*="titleTreatment"]',
-        '[class*="billboard-title"]',
-        '[class*="hero-title"]',
-        '.title-treatment',
-        '.previewModal-player-titleTreatment-logo',
-        '.previewModal-title',
-        '.bob-title',
-      ];
-      for (const selector of ancestorTitleSelectors) {
-        const titleEl = root.querySelector(selector);
-        if (titleEl) {
-          if (titleEl.tagName === 'IMG' && titleEl.alt) {
-            title = titleEl.alt.trim();
-            break rootSearch;
-          }
-          const text = titleEl.textContent?.trim();
-          if (text && text.length > 2 && text.length < 100) {
-            title = text;
-            break rootSearch;
-          }
-        }
-      }
-    }
-  }
-
-  if (!title) return null;
-
-  // Try to extract year from nearby DOM elements
-  if (!year) {
-    year = extractYearFromDOM(element);
-  }
-
-  // Try to detect series vs movie from DOM clues
-  if (!mediaType || mediaType === 'movie') {
-    const detectedType = detectMediaTypeFromDOM(element);
-    if (detectedType) {
-      mediaType = detectedType;
-    }
-  }
-
-  return {
-    title,
-    year,
-    mediaType: mediaType || null, // null = let service worker search both
-  };
-}
-
-// Helper: get the element and its relevant ancestors as search roots
-function getSearchRoots(element) {
-  const roots = [element];
-  // Look for preview modal or billboard ancestor
-  const ancestor = element.closest(
-    '[class*="previewModal"], [class*="jawBone"], .bob-card, .mini-modal, ' +
-    '[class*="billboard"], [class*="hero-image"], [class*="hero_billboard"]'
-  );
-  if (ancestor) roots.push(ancestor);
-  return roots;
-}
-
-// Try to find a year in the DOM near the hovered element
-function extractYearFromDOM(element) {
-  const searchRoots = getSearchRoots(element);
-
-  for (const root of searchRoots) {
-    // Look in supplemental/metadata text elements
-    const metaSelectors = [
-      '.year',
-      '[class*="year"]',
-      '.duration',
-      '[class*="duration"]',
-      '.meta',
-      '[class*="meta"]',
-      '.supplemental-message',
-      '[class*="supplemental"]',
-      '.videoMetadata',
-      '[class*="videoMetadata"]',
-      '.previewModal--detailsMetadata-left',
-      '[class*="detailsMetadata"]',
-      // Hero banner metadata
-      '[class*="billboard"] [class*="supplemental"]',
-      '[class*="billboard"] [class*="info"]',
-    ];
-
-    for (const sel of metaSelectors) {
-      const els = root.querySelectorAll(sel);
-      for (const el of els) {
-        const text = el.textContent?.trim();
-        if (text) {
-          const yearMatch = text.match(/(?:^|\s)((?:19[5-9]\d|20[0-3]\d))(?:\s|$|,|\))/);
-          if (yearMatch) {
-            const candidateYear = parseInt(yearMatch[1]);
-            const currentYear = new Date().getFullYear();
-            if (candidateYear >= 1950 && candidateYear <= currentYear + 1) {
-              log('Found year from DOM metadata:', yearMatch[1], 'in selector:', sel);
-              return yearMatch[1];
-            }
-          }
-        }
-      }
-    }
-  }
-
-  return null;
-}
-
-// Detect whether this is a series or movie from DOM clues
-function detectMediaTypeFromDOM(element) {
-  const searchRoots = getSearchRoots(element);
-
-  const metaSelectors = [
-    '.duration', '[class*="duration"]',
-    '.meta', '[class*="meta"]',
-    '.supplemental-message', '[class*="supplemental"]',
-    '.episodeSelector', '[class*="episode"]',
-    '.previewModal--detailsMetadata-left', '[class*="detailsMetadata"]',
-    // Hero banner metadata
-    '[class*="billboard"] [class*="supplemental"]',
-    '[class*="billboard"] [class*="info"]',
-  ];
-
-  for (const root of searchRoots) {
-    for (const sel of metaSelectors) {
-      const els = root.querySelectorAll(sel);
-      for (const el of els) {
-        const metaText = el.textContent || '';
-
-        // Series indicators — require specific patterns to avoid false positives
-        // from titles like "A Series of Unfortunate Events"
-        if (/\b(\d+\s+Seasons?|\d+\s+Episodes?|Season\s+\d|Episode\s+\d|Limited Series|TV Series|Mini.?Series)\b/i.test(metaText)) {
-          log('Detected series from DOM metadata:', sel);
-          return 'series';
-        }
-
-        // Movie indicators (duration like "1h 30m" or "2h 15m")
-        if (/\b\d+h\s*\d*m?\b/i.test(metaText)) {
-          log('Detected movie from duration format:', sel);
-          return 'movie';
-        }
-      }
-    }
-  }
-
-  return null;
-}
-
-function isNonTitleLabel(text) {
-  const lower = text.toLowerCase();
-  const skipWords = ['account', 'profile', 'search', 'menu', 'navigation',
-    'close', 'play', 'pause', 'volume', 'mute', 'forward', 'back',
-    'next', 'previous', 'settings', 'audio', 'subtitles', 'notifications'];
-  return skipWords.some(w => lower === w || (lower.length < 20 && lower.includes(w)));
-}
-
-function parseAriaLabel(label) {
-  // Match year formats: (2020), (2020–2024), (2020-2024), (2020-)
-  const yearMatch = label.match(/\((\d{4})(?:\s*[-–]\s*\d{0,4})?\)/);
-  const seasonMatch = label.match(/Season\s+\d+/i);
-  const episodeMatch = label.match(/Episode\s+\d+/i);
-
-  let title = label;
-  let year = null;
-  let mediaType = null;
-
-  if (yearMatch) {
-    year = yearMatch[1]; // Always use the start year
-    title = label.replace(/\s*\(\d{4}(?:\s*[-–]\s*\d{0,4})?\)\s*/, ' ').trim();
-  }
-
-  if (seasonMatch || episodeMatch) {
-    mediaType = 'series';
-    title = title.replace(/\s*-?\s*Season\s+\d+.*/i, '').trim();
-    title = title.replace(/\s*-?\s*Episode\s+\d+.*/i, '').trim();
-  }
-
-  // Remove trailer/teaser prefixes
-  title = title.replace(/^(Trailer|Teaser):\s*/i, '').trim();
-  title = title.replace(/\s*-\s*$/, '').trim();
-
-  return { title, year, mediaType };
-}
-
-function normalizeTitle(title) {
-  return title
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-// ─── Overlay rendering ───────────────────────────────────────
-
-function showFloatingOverlay(element, data) {
-  const overlay = createFloatingOverlay();
-
-  // Toggle hero-mode class for larger badges on hero banners
-  const heroMode = isHeroBanner(element);
-  overlay.classList.toggle('nro-hero-mode', heroMode);
-
-  if (data.loading) {
-    overlay.innerHTML = '<div class="nro-ratings-loading"><span class="nro-spinner"></span></div>';
-  } else if (data.error) {
-    hideFloatingOverlay();
-    return;
-  } else if (data.notFound) {
-    hideFloatingOverlay();
-    return;
-  } else {
-    const html = buildRatingHTML(data);
-    if (!html) {
-      hideFloatingOverlay();
-      return;
-    }
-    overlay.innerHTML = html;
-  }
-
-  positionOverlay(element);
-  overlay.style.opacity = '1';
-  startPositionTracking(element);
-}
-
-// ─── Overlay positioning — always top-left of the element ─────
-
-function positionOverlay(element) {
-  if (!floatingOverlay) return;
-
-  // Check element is still in the DOM (Netflix animations can remove it)
-  if (!document.body.contains(element)) return;
-
-  const rect = element.getBoundingClientRect();
-
-  // Skip if element is too small or not visible
-  if (rect.width < 10 || rect.height < 10) return;
-
-  // Determine if this is a hero/billboard banner (large element, typically full width)
-  const isHero = isHeroBanner(element);
-  const padding = isHero ? 20 : 8;
-
-  // Always anchor to top-left corner of the element
-  let left = rect.left + padding;
-  let top = rect.top + padding;
-
-  // Ensure the overlay stays within the viewport
-  const overlayRect = floatingOverlay.getBoundingClientRect();
-  const overlayWidth = overlayRect.width || 150;
-  const overlayHeight = overlayRect.height || 30;
-
-  // If top-left would push overlay off-screen right, clamp to right edge
-  if (left + overlayWidth > window.innerWidth - 10) {
-    left = window.innerWidth - overlayWidth - 10;
-  }
-  // If the element's top is above viewport (scrolled), clamp to top of viewport
-  if (top < 10) top = 10;
-  // If pushed below viewport, clamp
-  if (top + overlayHeight > window.innerHeight - 10) {
-    top = window.innerHeight - overlayHeight - 10;
-  }
-  if (left < 10) left = 10;
-
-  floatingOverlay.style.left = `${left}px`;
-  floatingOverlay.style.top = `${top}px`;
-}
-
-function isHeroBanner(element) {
-  // Check if this element or an ancestor is a hero/billboard banner
-  try {
-    return !!(
-      element.matches('[class*="billboard"], [class*="hero-image"], [class*="hero_billboard"]') ||
-      element.closest('[class*="billboard"], [class*="hero-image"], [class*="hero_billboard"]')
-    );
-  } catch (e) {
-    return false;
-  }
-}
-
-function startPositionTracking(element) {
-  stopPositionTracking();
-  positionInterval = setInterval(() => {
-    if (currentHoveredElement && floatingOverlay?.style.opacity === '1') {
-      positionOverlay(currentHoveredElement);
-    } else {
-      stopPositionTracking();
-    }
-  }, POSITION_UPDATE_MS);
-}
-
-function stopPositionTracking() {
-  if (positionInterval) {
-    clearInterval(positionInterval);
-    positionInterval = null;
-  }
-}
-
-function hideFloatingOverlay() {
-  if (floatingOverlay) {
-    floatingOverlay.style.opacity = '0';
-  }
-  stopPositionTracking();
-}
-
-// Escape HTML to prevent XSS from malformed API responses
-function escapeHTML(str) {
-  return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
-
-function buildRatingHTML(data) {
-  const parts = [];
-
-  if (data.imdbRating) {
-    parts.push(`
-      <div class="nro-rating-badge nro-imdb">
-        <span class="nro-rating-icon">IMDb</span>
-        <span class="nro-rating-value">${escapeHTML(data.imdbRating)}</span>
-      </div>
-    `);
-  }
-
-  if (data.rottenTomatoes) {
-    const score = parseInt(data.rottenTomatoes);
-    const freshness = score >= 60 ? 'fresh' : 'rotten';
-    parts.push(`
-      <div class="nro-rating-badge nro-rt nro-${freshness}">
-        <span class="nro-rating-icon">RT</span>
-        <span class="nro-rating-value">${escapeHTML(data.rottenTomatoes)}</span>
-      </div>
-    `);
-  }
-
-  return parts.length > 0 ? parts.join('') : null;
-}
-
-// ─── Event handlers ───────────────────────────────────────────
-
-function handleMouseEnter(event) {
-  if (!extensionEnabled) return;
-
-  const element = event.currentTarget;
-  currentHoveredElement = element;
-
-  clearTimeout(hideTimeout);
-  clearTimeout(hoverTimeout);
-
-  hoverTimeout = setTimeout(() => {
-    if (currentHoveredElement === element) {
-      fetchAndDisplayRating(element);
-    }
-  }, DEBOUNCE_MS);
-}
-
-function handleMouseLeave(event) {
-  clearTimeout(hoverTimeout);
-
-  clearTimeout(hideTimeout);
-  hideTimeout = setTimeout(() => {
-    const elementUnderMouse = document.elementFromPoint(lastMouseX, lastMouseY);
-    if (elementUnderMouse) {
-      const posterElement = findPosterAncestor(elementUnderMouse);
-
-      if (posterElement) {
-        log('Mouse still over Netflix content, keeping overlay');
-        currentHoveredElement = posterElement;
-        positionOverlay(currentHoveredElement);
-        ensureListenerAttached(posterElement);
-        return;
-      }
-    }
-
-    currentHoveredElement = null;
-    currentTitle = null;
-    hideFloatingOverlay();
-  }, HIDE_DELAY_MS);
-}
-
-function handleMouseMove(event) {
-  lastMouseX = event.clientX;
-  lastMouseY = event.clientY;
-}
-
-async function fetchAndDisplayRating(element) {
-  log('Fetching rating for element');
-
-  if (!chrome.runtime?.id) {
-    log('Extension context invalidated - please refresh the page');
-    return;
-  }
-
-  if (!extensionEnabled) {
-    log('Extension is disabled');
-    return;
-  }
-
-  const titleInfo = extractTitleFromElement(element);
-  if (!titleInfo || !titleInfo.title) {
-    log('No title found for this element');
-    return;
-  }
-
-  const normalizedTitle = normalizeTitle(titleInfo.title);
-
-  // Build a unique key that includes year and type for cache dedup
-  const cacheDedup = `${normalizedTitle}|${titleInfo.year || ''}|${titleInfo.mediaType || ''}`;
-
-  // If we're already showing this exact title+year+type, don't refetch
-  if (currentTitle === cacheDedup && floatingOverlay?.style.opacity === '1') {
-    log('Already showing rating for:', cacheDedup);
-    if (currentHoveredElement) {
-      positionOverlay(currentHoveredElement);
-    }
-    return;
-  }
-
-  log('Title info:', titleInfo);
-  currentTitle = cacheDedup;
-
-  // Increment request ID so stale in-flight responses are discarded
-  const thisRequestId = ++requestId;
-
-  // Only show spinner after 150ms (cached results return faster)
-  const loadingTimer = setTimeout(() => {
-    if (requestId === thisRequestId && currentHoveredElement === element) {
-      showFloatingOverlay(element, { loading: true });
-    }
-  }, 150);
-
-  try {
-    log('Sending request for:', normalizedTitle, 'year:', titleInfo.year, 'type:', titleInfo.mediaType);
-
-    const rating = await chrome.runtime.sendMessage({
-      type: 'FETCH_RATING',
-      title: normalizedTitle,
-      year: titleInfo.year || null,
-      mediaType: titleInfo.mediaType || null,
-    });
-
-    clearTimeout(loadingTimer);
-    log('Received rating:', rating);
-
-    // Only apply if this is still the latest request
-    if (requestId === thisRequestId && currentHoveredElement) {
-      showFloatingOverlay(currentHoveredElement, rating);
-    }
-  } catch (error) {
-    clearTimeout(loadingTimer);
-    console.error('Netflix Ratings: Failed to fetch rating:', error);
-    if (requestId === thisRequestId && currentHoveredElement) {
-      showFloatingOverlay(currentHoveredElement, { error: 'Failed to fetch rating' });
-    }
-  }
-}
-
-// ─── Poster & banner detection ────────────────────────────────
-
-// Selectors for small poster cards (bottom half — rows of movies/series)
-const POSTER_SELECTORS = [
+'use strict';
+
+/**
+ * Content Script — Netflix Ratings Overlay
+ *
+ * Injected into netflix.com pages. Detects poster cards and the hero
+ * billboard, extracts movie/show titles from the DOM, asks the service
+ * worker for ratings, and renders floating IMDb / Rotten Tomatoes badges.
+ *
+ * All mutable state is scoped inside an IIFE to avoid polluting the
+ * page's global namespace.
+ */
+
+(() => {
+
+// ═══════════════════════════════════════════════════════════════
+// CONSTANTS
+// ═══════════════════════════════════════════════════════════════
+
+const DEBOUNCE_MS       = 300;
+const HIDE_DELAY_MS     = 600;
+const POSITION_POLL_MS  = 200;
+const RESCAN_DELAYS     = [2000, 5000];  // delayed full-body rescans
+const URL_POLL_MS       = 1000;          // how often we check for SPA navigation
+const SPINNER_DELAY_MS  = 150;           // only show spinner if fetch is slower than this
+const DEBUG             = false;
+
+/** CSS selectors for poster cards (bottom-half rows). */
+const CARD_SELECTORS = [
   '.slider-item',
   '.title-card-container',
   '.bob-card',
@@ -602,7 +35,7 @@ const POSTER_SELECTORS = [
   '[class*="jawBone"]',
 ];
 
-// Selectors for the hero/billboard banner (top half — featured movie)
+/** CSS selectors for the hero/billboard banner (top-half). */
 const HERO_SELECTORS = [
   '.billboard-row',
   '[class*="billboard-row"]',
@@ -614,252 +47,606 @@ const HERO_SELECTORS = [
   '[class*="billboard"]:not([class*="billboard-motion"])',
 ];
 
-const ALL_SELECTORS = [...POSTER_SELECTORS, ...HERO_SELECTORS];
-const ALL_SELECTOR_STRING = ALL_SELECTORS.join(', ');
+const ALL_SELECTORS      = [...CARD_SELECTORS, ...HERO_SELECTORS];
+const ALL_SELECTOR_STR   = ALL_SELECTORS.join(', ');
 
-function findPosterAncestor(el) {
-  let best = null;
-  let current = el;
+/** Selectors for finding a title inside an element. */
+const TITLE_SELECTORS = [
+  // Hero / billboard
+  '.billboard-title .title-logo',
+  '.hero-title .title-logo',
+  '[class*="billboard"] .title-logo',
+  '[class*="hero"] .title-logo',
+  '[class*="billboard"] [class*="title-treatment"]',
+  '[class*="billboard"] [class*="titleTreatment"]',
+  '[class*="billboard-title"]',
+  '[class*="hero-title"]',
+  '.title-treatment',
+  // Card / modal
+  '.fallback-text',
+  '.title-card-title',
+  '.previewModal-player-titleTreatment-logo',
+  '.previewModal-title',
+  '.bob-title',
+];
 
-  while (current && current !== document.body) {
-    if (matchesAnySelector(current)) {
-      best = current;
+/** Selectors for metadata containers that may hold year / duration info. */
+const META_SELECTORS = [
+  '.year', '[class*="year"]',
+  '.duration', '[class*="duration"]',
+  '.meta', '[class*="meta"]',
+  '.supplemental-message', '[class*="supplemental"]',
+  '.videoMetadata', '[class*="videoMetadata"]',
+  '.previewModal--detailsMetadata-left', '[class*="detailsMetadata"]',
+  '.episodeSelector', '[class*="episode"]',
+  '[class*="billboard"] [class*="supplemental"]',
+  '[class*="billboard"] [class*="info"]',
+];
+
+/** Words that indicate an aria-label is NOT a movie title. */
+const NON_TITLE_WORDS = [
+  'account', 'profile', 'search', 'menu', 'navigation',
+  'close', 'play', 'pause', 'volume', 'mute', 'forward', 'back',
+  'next', 'previous', 'settings', 'audio', 'subtitles', 'notifications',
+];
+
+const HERO_MATCH = '[class*="billboard"], [class*="hero-image"], [class*="hero_billboard"]';
+const ANCESTOR_MATCH =
+  '[class*="previewModal"], [class*="jawBone"], .bob-card, .mini-modal, ' + HERO_MATCH;
+
+// ═══════════════════════════════════════════════════════════════
+// MUTABLE STATE
+// ═══════════════════════════════════════════════════════════════
+
+let enabled           = true;
+let initialized       = false;
+let overlay           = null;   // the single floating overlay <div>
+let hoveredEl         = null;   // element the user is currently hovering
+let hoveredTitle      = null;   // dedup key for the currently-shown rating
+let mouseX            = 0;
+let mouseY            = 0;
+let requestSeq        = 0;      // monotonically increasing; stale responses are ignored
+let hoverTimer        = null;
+let hideTimer         = null;
+let posTimer          = null;
+let scanTimers        = [];     // delayed rescan setTimeout IDs
+let pendingBodyScan   = null;
+let mutObs            = null;   // MutationObserver for new DOM nodes
+let urlPollId         = null;   // setInterval ID for SPA nav detection
+let lastUrl           = location.href;
+
+// ═══════════════════════════════════════════════════════════════
+// LOGGING
+// ═══════════════════════════════════════════════════════════════
+
+function log(...args) {
+  if (DEBUG) console.log('[NRO]', ...args);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// OVERLAY — single floating element, re-used across hovers
+// ═══════════════════════════════════════════════════════════════
+
+function ensureOverlay() {
+  if (overlay && document.body.contains(overlay)) return overlay;
+  overlay?.remove();
+
+  overlay = document.createElement('div');
+  overlay.id = 'nro-floating-overlay';
+  // Positioning and visibility are driven by class + styles.css.
+  // We only set the essentials inline so they survive even if the
+  // stylesheet is somehow blocked.
+  overlay.style.cssText =
+    'position:fixed!important;z-index:999999!important;' +
+    'pointer-events:none!important;opacity:0;' +
+    'transition:opacity .15s ease-out;display:flex;gap:4px;';
+  document.body.appendChild(overlay);
+  return overlay;
+}
+
+function showOverlay(element, data) {
+  const el = ensureOverlay();
+  el.classList.toggle('nro-hero-mode', isHero(element));
+
+  if (data.loading) {
+    el.innerHTML = '<div class="nro-ratings-loading"><span class="nro-spinner"></span></div>';
+  } else if (data.error || data.notFound) {
+    hideOverlay();
+    return;
+  } else {
+    const html = buildBadgesHTML(data);
+    if (!html) { hideOverlay(); return; }
+    el.innerHTML = html;
+  }
+
+  positionOverlay(element);
+  el.style.opacity = '1';
+  startPositionPoll(element);
+}
+
+function hideOverlay() {
+  if (overlay) overlay.style.opacity = '0';
+  stopPositionPoll();
+}
+
+// ─── Positioning — always top-left of the hovered element ─────
+
+function positionOverlay(element) {
+  if (!overlay || !document.body.contains(element)) return;
+
+  const r = element.getBoundingClientRect();
+  if (r.width < 10 || r.height < 10) return;
+
+  const pad = isHero(element) ? 20 : 8;
+  let left  = r.left + pad;
+  let top   = r.top  + pad;
+
+  const ow = overlay.offsetWidth  || 150;
+  const oh = overlay.offsetHeight || 30;
+
+  if (left + ow > window.innerWidth  - 10) left = window.innerWidth  - ow - 10;
+  if (top  + oh > window.innerHeight - 10) top  = window.innerHeight - oh - 10;
+  if (left < 10) left = 10;
+  if (top  < 10) top  = 10;
+
+  overlay.style.left = `${left}px`;
+  overlay.style.top  = `${top}px`;
+}
+
+function startPositionPoll(element) {
+  stopPositionPoll();
+  posTimer = setInterval(() => {
+    if (hoveredEl && overlay?.style.opacity === '1') {
+      positionOverlay(hoveredEl);
+    } else {
+      stopPositionPoll();
     }
-    current = current.parentElement;
-  }
-
-  return best;
+  }, POSITION_POLL_MS);
 }
 
-function matchesAnySelector(el) {
-  try {
-    return el.matches && el.matches(ALL_SELECTOR_STRING);
-  } catch (e) {
-    return false;
-  }
+function stopPositionPoll() {
+  if (posTimer) { clearInterval(posTimer); posTimer = null; }
 }
 
-function ensureListenerAttached(element) {
-  if (element && !element.dataset.nroAttached) {
-    const href = element.getAttribute('href') || '';
-    if (href.includes('Account') || href.includes('profile')) return;
-
-    element.dataset.nroAttached = 'true';
-    element.addEventListener('mouseenter', handleMouseEnter);
-    element.addEventListener('mouseleave', handleMouseLeave);
-  }
+function isHero(el) {
+  try { return !!(el.matches?.(HERO_MATCH) || el.closest?.(HERO_MATCH)); }
+  catch { return false; }
 }
 
-function attachHoverListeners(container) {
-  const elements = container.querySelectorAll(ALL_SELECTOR_STRING);
+// ═══════════════════════════════════════════════════════════════
+// BADGE RENDERING
+// ═══════════════════════════════════════════════════════════════
 
-  elements.forEach(el => {
-    if (el.dataset.nroAttached) return;
-
-    // Skip if any ancestor is already attached (outermost-only strategy)
-    const parentEl = el.parentElement?.closest(ALL_SELECTOR_STRING);
-    if (parentEl && parentEl.dataset.nroAttached) return;
-
-    // If parent exists within this container but isn't attached yet,
-    // skip this child — the parent will be processed in its own iteration.
-    if (parentEl && container.contains(parentEl)) return;
-
-    const href = el.getAttribute('href') || '';
-    if (href.includes('Account') || href.includes('profile')) return;
-
-    el.dataset.nroAttached = 'true';
-    el.addEventListener('mouseenter', handleMouseEnter);
-    el.addEventListener('mouseleave', handleMouseLeave);
-  });
-
-  // Also attach directly to the container if it matches (e.g., MutationObserver
-  // adds a billboard node itself, not just children)
-  if (!container.dataset?.nroAttached && matchesAnySelector(container)) {
-    container.dataset.nroAttached = 'true';
-    container.addEventListener('mouseenter', handleMouseEnter);
-    container.addEventListener('mouseleave', handleMouseLeave);
-  }
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;')
+                  .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
-// ─── MutationObserver ─────────────────────────────────────────
+function buildBadgesHTML(data) {
+  const parts = [];
 
-function initObserver() {
-  if (mutationObserver) {
-    mutationObserver.disconnect();
-    mutationObserver = null;
+  if (data.imdbRating) {
+    parts.push(
+      `<div class="nro-rating-badge nro-imdb">` +
+        `<span class="nro-rating-icon">IMDb</span>` +
+        `<span class="nro-rating-value">${esc(data.imdbRating)}</span>` +
+      `</div>`
+    );
   }
 
-  mutationObserver = new MutationObserver((mutations) => {
-    for (const mutation of mutations) {
-      for (const node of mutation.addedNodes) {
-        if (node.nodeType === Node.ELEMENT_NODE) {
-          attachHoverListeners(node);
+  if (data.rottenTomatoes) {
+    const fresh = parseInt(data.rottenTomatoes, 10) >= 60 ? 'fresh' : 'rotten';
+    parts.push(
+      `<div class="nro-rating-badge nro-rt nro-${fresh}">` +
+        `<span class="nro-rating-icon">RT</span>` +
+        `<span class="nro-rating-value">${esc(data.rottenTomatoes)}</span>` +
+      `</div>`
+    );
+  }
+
+  return parts.length ? parts.join('') : null;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// TITLE & METADATA EXTRACTION
+// ═══════════════════════════════════════════════════════════════
+
+function extractTitle(element) {
+  let title = null, year = null, mediaType = null;
+
+  // Strategy 1 — aria-label
+  const label = element.getAttribute('aria-label')
+    || element.closest('[aria-label]')?.getAttribute('aria-label');
+  if (label && label.length > 2 && !isNonTitle(label)) {
+    ({ title, year, mediaType } = parseAriaLabel(label));
+  }
+
+  // Strategy 2 — <img alt>
+  if (!title) {
+    const img = element.querySelector('img[alt]')
+      || element.closest('.title-card-container, .slider-item')?.querySelector('img[alt]');
+    if (img?.alt?.length > 2 && !isNonTitle(img.alt)) title = img.alt.trim();
+  }
+
+  // Strategy 3 — known title-element selectors within this element
+  if (!title) title = findTitleText(element);
+
+  // Strategy 4 — search ancestor (preview modal / billboard)
+  if (!title) {
+    for (const root of ancestorRoots(element)) {
+      if (root === element) continue;
+      title = findTitleText(root);
+      if (title) break;
+    }
+  }
+
+  if (!title) return null;
+
+  if (!year)      year      = extractYear(element);
+  if (!mediaType) mediaType = detectMediaType(element);
+
+  return { title, year, mediaType: mediaType || null };
+}
+
+function findTitleText(root) {
+  for (const sel of TITLE_SELECTORS) {
+    const el = root.querySelector(sel);
+    if (!el) continue;
+    if (el.tagName === 'IMG' && el.alt) return el.alt.trim();
+    const t = el.textContent?.trim();
+    if (t && t.length > 2 && t.length < 100 && !isNonTitle(t)) return t;
+  }
+  return null;
+}
+
+function ancestorRoots(el) {
+  const roots = [el];
+  const a = el.closest(ANCESTOR_MATCH);
+  if (a) roots.push(a);
+  return roots;
+}
+
+function extractYear(element) {
+  for (const root of ancestorRoots(element)) {
+    for (const sel of META_SELECTORS) {
+      for (const el of root.querySelectorAll(sel)) {
+        const m = el.textContent?.match(/(?:^|\s)((?:19[5-9]\d|20[0-3]\d))(?:\s|$|,|\))/);
+        if (m) {
+          const y = parseInt(m[1], 10);
+          if (y >= 1950 && y <= new Date().getFullYear() + 1) return m[1];
         }
       }
     }
+  }
+  return null;
+}
 
+function detectMediaType(element) {
+  const SERIES_RE = /\b(\d+\s+Seasons?|\d+\s+Episodes?|Season\s+\d|Episode\s+\d|Limited Series|TV Series|Mini.?Series)\b/i;
+  const MOVIE_RE  = /\b\d+h\s*\d*m?\b/i;
+
+  for (const root of ancestorRoots(element)) {
+    for (const sel of META_SELECTORS) {
+      for (const el of root.querySelectorAll(sel)) {
+        const t = el.textContent || '';
+        if (SERIES_RE.test(t)) return 'series';
+        if (MOVIE_RE.test(t))  return 'movie';
+      }
+    }
+  }
+  return null;
+}
+
+function isNonTitle(text) {
+  const lc = text.toLowerCase();
+  return NON_TITLE_WORDS.some(w => lc === w || (lc.length < 20 && lc.includes(w)));
+}
+
+function parseAriaLabel(label) {
+  const ym = label.match(/\((\d{4})(?:\s*[-–]\s*\d{0,4})?\)/);
+  const hasSeason  = /Season\s+\d+/i.test(label);
+  const hasEpisode = /Episode\s+\d+/i.test(label);
+
+  let title = label;
+  let year  = null;
+  let mediaType = null;
+
+  if (ym) {
+    year  = ym[1];
+    title = label.replace(/\s*\(\d{4}(?:\s*[-–]\s*\d{0,4})?\)\s*/, ' ').trim();
+  }
+  if (hasSeason || hasEpisode) {
+    mediaType = 'series';
+    title = title.replace(/\s*-?\s*Season\s+\d+.*/i, '').trim();
+    title = title.replace(/\s*-?\s*Episode\s+\d+.*/i, '').trim();
+  }
+
+  title = title.replace(/^(Trailer|Teaser):\s*/i, '').replace(/\s*-\s*$/, '').trim();
+  return { title, year, mediaType };
+}
+
+function normalizeTitle(t) { return t.replace(/\s+/g, ' ').trim(); }
+
+// ═══════════════════════════════════════════════════════════════
+// EVENT HANDLERS
+// ═══════════════════════════════════════════════════════════════
+
+function onMouseEnter(e) {
+  if (!enabled) return;
+  const el = e.currentTarget;
+  hoveredEl = el;
+  clearTimeout(hideTimer);
+  clearTimeout(hoverTimer);
+  hoverTimer = setTimeout(() => {
+    if (hoveredEl === el) fetchRating(el);
+  }, DEBOUNCE_MS);
+}
+
+function onMouseLeave() {
+  clearTimeout(hoverTimer);
+  clearTimeout(hideTimer);
+  hideTimer = setTimeout(() => {
+    const under = document.elementFromPoint(mouseX, mouseY);
+    if (under) {
+      const card = findAncestorCard(under);
+      if (card) {
+        hoveredEl = card;
+        positionOverlay(card);
+        attach(card);
+        return;
+      }
+    }
+    hoveredEl = null;
+    hoveredTitle = null;
+    hideOverlay();
+  }, HIDE_DELAY_MS);
+}
+
+function onMouseMove(e) { mouseX = e.clientX; mouseY = e.clientY; }
+
+function onDocMouseOver(e) {
+  if (!enabled || !e.target?.closest) return;
+  const card = findAncestorCard(e.target);
+  if (card && !card.dataset.nroAttached) {
+    clearTimeout(hideTimer);
+    attach(card);
+    if (overlay?.style.opacity === '1') {
+      hoveredEl = card;
+      positionOverlay(card);
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// FETCH & DISPLAY
+// ═══════════════════════════════════════════════════════════════
+
+async function fetchRating(element) {
+  if (!chrome.runtime?.id) { log('context invalidated'); return; }
+  if (!enabled) return;
+
+  const info = extractTitle(element);
+  if (!info?.title) { log('no title found'); return; }
+
+  const norm  = normalizeTitle(info.title);
+  const dedup = `${norm}|${info.year || ''}|${info.mediaType || ''}`;
+
+  if (hoveredTitle === dedup && overlay?.style.opacity === '1') {
+    positionOverlay(element);
+    return;
+  }
+  hoveredTitle = dedup;
+
+  const seq = ++requestSeq;
+
+  const spinnerTimer = setTimeout(() => {
+    if (requestSeq === seq && hoveredEl === element) {
+      showOverlay(element, { loading: true });
+    }
+  }, SPINNER_DELAY_MS);
+
+  try {
+    const rating = await chrome.runtime.sendMessage({
+      type: 'FETCH_RATING',
+      title: norm,
+      year: info.year || null,
+      mediaType: info.mediaType || null,
+    });
+    clearTimeout(spinnerTimer);
+    if (requestSeq === seq && hoveredEl) showOverlay(hoveredEl, rating);
+  } catch (err) {
+    clearTimeout(spinnerTimer);
+    console.error('[NRO] fetch failed:', err);
+    if (requestSeq === seq && hoveredEl) {
+      showOverlay(hoveredEl, { error: 'Failed to fetch rating' });
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CARD DETECTION & LISTENER ATTACHMENT
+// ═══════════════════════════════════════════════════════════════
+
+function findAncestorCard(el) {
+  let best = null, cur = el;
+  while (cur && cur !== document.body) {
+    if (matchesCard(cur)) best = cur;
+    cur = cur.parentElement;
+  }
+  return best;
+}
+
+function matchesCard(el) {
+  try { return el.matches?.(ALL_SELECTOR_STR); }
+  catch { return false; }
+}
+
+function attach(el) {
+  if (!el || el.dataset.nroAttached) return;
+  const href = el.getAttribute('href') || '';
+  if (href.includes('Account') || href.includes('profile')) return;
+  el.dataset.nroAttached = 'true';
+  el.addEventListener('mouseenter', onMouseEnter);
+  el.addEventListener('mouseleave', onMouseLeave);
+}
+
+function attachAll(container) {
+  for (const el of container.querySelectorAll(ALL_SELECTOR_STR)) {
+    if (el.dataset.nroAttached) continue;
+    // Only attach outermost matched element
+    const parent = el.parentElement?.closest(ALL_SELECTOR_STR);
+    if (parent && (parent.dataset.nroAttached || container.contains(parent))) continue;
+    attach(el);
+  }
+  // If the container itself matches, attach it too
+  if (matchesCard(container)) attach(container);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MUTATION OBSERVER
+// ═══════════════════════════════════════════════════════════════
+
+function startObserver() {
+  stopObserver();
+  mutObs = new MutationObserver(mutations => {
+    for (const m of mutations) {
+      for (const node of m.addedNodes) {
+        if (node.nodeType === Node.ELEMENT_NODE) attachAll(node);
+      }
+    }
+    // Coalesce: one full-body rescan per second max
     if (!pendingBodyScan) {
       pendingBodyScan = setTimeout(() => {
         pendingBodyScan = null;
-        attachHoverListeners(document.body);
+        attachAll(document.body);
       }, 1000);
     }
   });
-
-  mutationObserver.observe(document.body, {
-    childList: true,
-    subtree: true
-  });
-
-  return mutationObserver;
+  mutObs.observe(document.body, { childList: true, subtree: true });
 }
 
-// ─── Document-level mouseover for dynamic content ─────────────
+function stopObserver() {
+  mutObs?.disconnect();
+  mutObs = null;
+}
 
-function handleDocumentMouseOver(event) {
-  if (!extensionEnabled) return;
+// ═══════════════════════════════════════════════════════════════
+// SPA NAVIGATION DETECTION
+// ═══════════════════════════════════════════════════════════════
 
-  const target = event.target;
+// Netflix is a SPA — the URL changes without a page reload.
+// We poll location.href every second instead of observing the
+// entire DOM just to detect URL changes.
 
-  // Early bail: skip non-element targets
-  if (!target || !target.closest) return;
-
-  const matchedElement = findPosterAncestor(target);
-
-  if (matchedElement && !matchedElement.dataset.nroAttached) {
-    clearTimeout(hideTimeout);
-    ensureListenerAttached(matchedElement);
-
-    if (floatingOverlay && floatingOverlay.style.opacity === '1') {
-      currentHoveredElement = matchedElement;
-      positionOverlay(matchedElement);
+function startUrlPoll() {
+  stopUrlPoll();
+  urlPollId = setInterval(() => {
+    if (location.href !== lastUrl) {
+      lastUrl = location.href;
+      log('URL changed → reinit');
+      setTimeout(init, 500);
     }
-  }
+  }, URL_POLL_MS);
 }
 
-// ─── Listen for enable/disable changes from popup ─────────────
+function stopUrlPoll() {
+  if (urlPollId) { clearInterval(urlPollId); urlPollId = null; }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// STORAGE LISTENER — react to enable/disable from popup
+// ═══════════════════════════════════════════════════════════════
 
 function onStorageChanged(changes, area) {
-  if (area !== 'local') return;
+  if (area !== 'local' || !('enabled' in changes)) return;
 
-  if ('enabled' in changes) {
-    extensionEnabled = changes.enabled.newValue !== false;
-    log('Extension enabled changed to:', extensionEnabled);
+  enabled = changes.enabled.newValue !== false;
+  log('enabled →', enabled);
 
-    if (!extensionEnabled) {
-      clearTimeout(hoverTimeout);
-      clearTimeout(hideTimeout);
-      currentHoveredElement = null;
-      currentTitle = null;
-      hideFloatingOverlay();
-    } else {
-      // Re-initialize when re-enabled so overlay, observers, and listeners are set up
-      init();
-    }
+  if (!enabled) {
+    clearTimeout(hoverTimer);
+    clearTimeout(hideTimer);
+    hoveredEl = null;
+    hoveredTitle = null;
+    hideOverlay();
+  } else {
+    init();
   }
 }
 
-// ─── Cleanup ──────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+// LIFECYCLE
+// ═══════════════════════════════════════════════════════════════
 
 function cleanup() {
-  if (mutationObserver) {
-    mutationObserver.disconnect();
-    mutationObserver = null;
-  }
-
-  clearTimeout(hoverTimeout);
-  clearTimeout(hideTimeout);
-  clearTimeout(attachScanTimeout);
-  clearTimeout(attachScanTimeout2);
+  stopObserver();
+  stopPositionPoll();
+  clearTimeout(hoverTimer);
+  clearTimeout(hideTimer);
   clearTimeout(pendingBodyScan);
-  stopPositionTracking();
+  scanTimers.forEach(clearTimeout);
 
-  hoverTimeout = null;
-  hideTimeout = null;
-  attachScanTimeout = null;
-  attachScanTimeout2 = null;
-  pendingBodyScan = null;
-  requestId = 0;
+  hoverTimer = hideTimer = pendingBodyScan = null;
+  scanTimers = [];
+  requestSeq = 0;
 
-  document.removeEventListener('mousemove', handleMouseMove);
-  document.removeEventListener('mouseover', handleDocumentMouseOver);
+  document.removeEventListener('mousemove', onMouseMove);
+  document.removeEventListener('mouseover', onDocMouseOver);
 }
 
-// ─── Initialization ───────────────────────────────────────────
-
 async function init() {
-  log('Starting initialization...');
-
+  log('init');
   cleanup();
 
-  let settings;
   try {
-    settings = await chrome.storage.local.get(['enabled', 'apiKey']);
-  } catch (e) {
-    log('Extension context invalidated');
+    const s = await chrome.storage.local.get(['enabled', 'apiKey']);
+    enabled = s.enabled !== false;
+    if (!s.apiKey) log('WARNING: no API key configured');
+  } catch {
+    log('context invalidated');
     return;
   }
 
-  extensionEnabled = settings.enabled !== false;
-  log('Settings:', { enabled: extensionEnabled, hasApiKey: !!settings.apiKey });
-
-  if (!extensionEnabled) {
-    log('Extension is disabled');
-    if (!initialized) {
-      chrome.storage.onChanged.addListener(onStorageChanged);
-    }
+  if (!enabled) {
+    if (!initialized) chrome.storage.onChanged.addListener(onStorageChanged);
     initialized = true;
     return;
   }
 
-  if (!settings.apiKey) {
-    log('WARNING: No API key configured!');
-  }
+  ensureOverlay();
 
-  createFloatingOverlay();
+  document.addEventListener('mousemove', onMouseMove, { passive: true });
+  document.addEventListener('mouseover', onDocMouseOver, { passive: true });
 
-  document.addEventListener('mousemove', handleMouseMove, { passive: true });
-  document.addEventListener('mouseover', handleDocumentMouseOver, { passive: true });
+  if (!initialized) chrome.storage.onChanged.addListener(onStorageChanged);
 
-  if (!initialized) {
-    chrome.storage.onChanged.addListener(onStorageChanged);
-  }
+  attachAll(document.body);
+  startObserver();
 
-  attachHoverListeners(document.body);
-  log('Initial scan complete');
+  // Delayed rescans to catch lazy-loaded content
+  scanTimers = RESCAN_DELAYS.map(ms =>
+    setTimeout(() => attachAll(document.body), ms)
+  );
 
-  initObserver();
-  log('Observer started');
-
-  attachScanTimeout = setTimeout(() => attachHoverListeners(document.body), 2000);
-  attachScanTimeout2 = setTimeout(() => attachHoverListeners(document.body), 5000);
+  startUrlPoll();
 
   initialized = true;
-  log('Initialization complete!');
+  log('ready');
 }
 
+// ─── Bootstrap ────────────────────────────────────────────────
+
 if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', init);
+  document.addEventListener('DOMContentLoaded', init, { once: true });
 } else {
   init();
 }
 
-let lastUrl = location.href;
-urlObserver = new MutationObserver(() => {
-  const url = location.href;
-  if (url !== lastUrl) {
-    lastUrl = url;
-    log('URL changed, reinitializing...');
-    setTimeout(init, 1000);
-  }
-});
-urlObserver.observe(document, { subtree: true, childList: true });
+// ─── Page unload cleanup ──────────────────────────────────────
 
-// Clean up intervals and observers when the page unloads
-window.addEventListener('beforeunload', () => {
+window.addEventListener('pagehide', () => {
   cleanup();
-  if (urlObserver) {
-    urlObserver.disconnect();
-    urlObserver = null;
-  }
+  stopUrlPoll();
 });
+
+})(); // end IIFE

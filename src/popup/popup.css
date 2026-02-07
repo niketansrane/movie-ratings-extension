@@ -1,4 +1,4 @@
-/* Popup Styles for Netflix Ratings Extension */
+/* Popup Styles — Netflix Ratings Overlay */
 
 * {
   margin: 0;
@@ -17,6 +17,8 @@ body {
 .popup-container {
   padding: 16px;
 }
+
+/* ─── Header ─────────────────────────────────────────────────── */
 
 .header {
   text-align: center;
@@ -40,17 +42,21 @@ body {
   color: #888;
 }
 
+/* ─── Sections ───────────────────────────────────────────────── */
+
 .section {
   margin-bottom: 16px;
 }
 
-.section label {
+.section > label {
   display: block;
   font-size: 12px;
   font-weight: 500;
   color: #aaa;
   margin-bottom: 6px;
 }
+
+/* ─── Input group ────────────────────────────────────────────── */
 
 .input-group {
   display: flex;
@@ -114,7 +120,8 @@ input::placeholder {
   color: #f5c518;
 }
 
-/* Toggle Switch */
+/* ─── Toggle switch ──────────────────────────────────────────── */
+
 .toggle {
   display: flex;
   align-items: center;
@@ -134,6 +141,7 @@ input::placeholder {
   position: relative;
   transition: background 0.2s;
   margin-right: 10px;
+  flex-shrink: 0;
 }
 
 .toggle .slider::before {
@@ -156,12 +164,13 @@ input::placeholder {
   transform: translateX(18px);
 }
 
-.toggle .label {
+.toggle .label-text {
   font-size: 14px;
   color: #fff;
 }
 
-/* Stats */
+/* ─── Stats ──────────────────────────────────────────────────── */
+
 .stats {
   display: flex;
   gap: 16px;
@@ -189,7 +198,8 @@ input::placeholder {
   margin-top: 2px;
 }
 
-/* Buttons */
+/* ─── Buttons ────────────────────────────────────────────────── */
+
 .button-group {
   display: flex;
   gap: 8px;
@@ -207,19 +217,22 @@ input::placeholder {
   transition: all 0.2s;
 }
 
+.btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+
 .btn.primary {
   background: #e50914;
   color: #fff;
 }
 
-.btn.primary:hover {
+.btn.primary:hover:not(:disabled) {
   background: #f40612;
 }
 
 .btn.primary:disabled {
   background: #666;
-  cursor: not-allowed;
-  opacity: 0.7;
 }
 
 .btn.secondary {
@@ -227,11 +240,12 @@ input::placeholder {
   color: #fff;
 }
 
-.btn.secondary:hover {
+.btn.secondary:hover:not(:disabled) {
   background: #444;
 }
 
-/* Status Message */
+/* ─── Status message ─────────────────────────────────────────── */
+
 .status {
   text-align: center;
   font-size: 12px;
@@ -260,7 +274,8 @@ input::placeholder {
   opacity: 1;
 }
 
-/* Footer */
+/* ─── Footer ─────────────────────────────────────────────────── */
+
 .footer {
   margin-top: 16px;
   padding-top: 12px;

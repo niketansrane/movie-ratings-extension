@@ -1,471 +1,370 @@
-// Service Worker for Netflix Ratings Overlay
-// Handles OMDb API calls, smart matching, and caching
+'use strict';
 
-const CACHE_TTL = 7 * 24 * 60 * 60 * 1000; // 7 days
-const MAX_CACHE_SIZE = 1000;
-const PRUNE_CHECK_INTERVAL = 50;
-const API_DAILY_LIMIT = 1000;
+/**
+ * Service Worker — Netflix Ratings Overlay
+ *
+ * Responsibilities:
+ *  1. Listen for FETCH_RATING messages from the content script.
+ *  2. Check the local rating cache (chrome.storage.local).
+ *  3. Query OMDb API when cache misses, using smart search + scoring.
+ *  4. Cache results for 7 days; prune old / over-limit entries.
+ *  5. Track daily API usage to respect the free-tier limit.
+ *
+ * All state is in chrome.storage.local — the service worker is ephemeral.
+ */
+
+// ─── Constants (duplicated from src/constants/config.js — no ES imports in SW) ─
+
+const CACHE_TTL_MS       = 7 * 24 * 60 * 60 * 1000; // 7 days
+const MAX_CACHE_SIZE     = 1000;
+const PRUNE_INTERVAL     = 50;
+const API_DAILY_LIMIT    = 1000;
 const API_WARN_THRESHOLD = 900;
-const FETCH_TIMEOUT_MS = 8000; // 8 second timeout for API calls
+const FETCH_TIMEOUT_MS   = 8000;
+const CACHE_KEY_PREFIX   = 'rating_';
+const PRUNE_COUNTER_KEY  = '_nro_cacheWriteCount';
 
-// Listen for messages from content script
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  if (request.type === 'FETCH_RATING') {
-    fetchRating(request.title, request.year, request.mediaType)
-      .then(sendResponse)
-      .catch(error => sendResponse({ error: error.message }));
-    return true;
-  }
+// ─── Message listener ─────────────────────────────────────────
+
+chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
+  if (request.type !== 'FETCH_RATING') return false;
+
+  handleFetchRating(request)
+    .then(sendResponse)
+    .catch(err => sendResponse({ error: err.message || 'Unknown error' }));
+
+  return true; // keep message channel open for async response
 });
 
-async function fetchRating(title, year, mediaType) {
-  // Cache key includes year and type so different versions of the same title
-  // are cached separately. Truncate long titles to keep keys reasonable.
-  const keyTitle = title.toLowerCase().substring(0, 100);
-  const cacheKey = `rating_${keyTitle}_${year || ''}_${mediaType || 'any'}`;
+// ─── Top-level handler ────────────────────────────────────────
 
-  // Check cache first
-  const cached = await getCachedRating(cacheKey);
+async function handleFetchRating({ title, year, mediaType }) {
+  const keyTitle = title.toLowerCase().substring(0, 100);
+  const cacheKey = `${CACHE_KEY_PREFIX}${keyTitle}_${year || ''}_${mediaType || 'any'}`;
+
+  // 1. Cache hit?
+  const cached = await getCached(cacheKey);
   if (cached) return cached;
 
-  // Fetch from OMDb API
-  const apiKey = await getApiKey();
+  // 2. API key configured?
+  const apiKey = (await chrome.storage.local.get('apiKey')).apiKey;
   if (!apiKey) {
     return { error: 'API key not configured. Click the extension icon to add your OMDb API key.' };
   }
 
-  const apiCallCount = await getApiCallCount();
-  if (apiCallCount >= API_DAILY_LIMIT) {
-    return { error: 'Daily API limit reached (1000 requests). Ratings will resume tomorrow.' };
+  // 3. Under daily limit?
+  if (await getApiCallCount() >= API_DAILY_LIMIT) {
+    return { error: 'Daily API limit reached (1,000 requests). Ratings will resume tomorrow.' };
   }
 
+  // 4. Query OMDb
   try {
-    let result;
-
-    if (year && mediaType) {
-      // Best case: we have both year and type — do a precise exact search
-      result = await exactSearch(apiKey, title, year, mediaType);
-    } else if (year) {
-      // We have year but not type — try exact search without type restriction
-      result = await exactSearchWithYear(apiKey, title, year);
-    } else if (mediaType) {
-      // We have type but no year — use search API to find best match
-      result = await smartSearch(apiKey, title, null, mediaType);
-    } else {
-      // Neither year nor type — use search API for best match
-      result = await smartSearch(apiKey, title, null, null);
-    }
+    const result = await queryOMDb(apiKey, title, year, mediaType);
 
     if (result) {
-      return await processAndCacheRating(cacheKey, result);
+      return await processAndCache(cacheKey, result);
     }
 
-    // Nothing found — cache the miss
-    const notFoundResult = { notFound: true, title, cachedAt: Date.now() };
-    await cacheRating(cacheKey, notFoundResult);
-    return notFoundResult;
-
-  } catch (error) {
-    console.error('OMDb API error:', error);
-    // Preserve specific error messages (e.g. invalid API key) instead of generic fallback
-    const message = error.message || 'Failed to fetch rating. Please try again.';
-    return { error: message };
+    // Cache the miss so we don't keep retrying
+    const miss = { notFound: true, title, cachedAt: Date.now() };
+    await writeCache(cacheKey, miss);
+    return miss;
+  } catch (err) {
+    console.error('[NRO] OMDb error:', err);
+    return { error: err.message || 'Failed to fetch rating.' };
   }
 }
 
-// ─── Search strategies ────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+// OMDb SEARCH STRATEGIES
+// ═══════════════════════════════════════════════════════════════
 
-// Fetch with timeout to prevent hanging on slow/unresponsive API
-async function fetchWithTimeout(url, timeoutMs = FETCH_TIMEOUT_MS) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const response = await fetch(url, { signal: controller.signal });
-    clearTimeout(timer);
-    return response;
-  } catch (error) {
-    clearTimeout(timer);
-    if (error.name === 'AbortError') {
-      throw new Error('Request timed out. OMDb API may be slow — please try again.');
-    }
-    throw error;
-  }
+/**
+ * Choose the best search strategy based on what metadata the content
+ * script was able to extract from the Netflix DOM.
+ */
+async function queryOMDb(apiKey, title, year, mediaType) {
+  if (year && mediaType) return exactSearch(apiKey, title, year, mediaType);
+  if (year)             return searchBothTypes(apiKey, title, year);
+  return smartSearch(apiKey, title, year, mediaType);
 }
 
-// Exact search with title, year, and type — most precise
-async function exactSearch(apiKey, title, year, mediaType) {
-  const params = new URLSearchParams({
-    apikey: apiKey,
-    t: title,
-  });
-  if (year) params.append('y', year);
-  if (mediaType) params.append('type', mediaType);
+/** Precise search: title + year + type. */
+async function exactSearch(apiKey, title, year, type) {
+  const params = new URLSearchParams({ apikey: apiKey, t: title });
+  if (year) params.set('y', year);
+  if (type) params.set('type', type);
 
-  const response = await fetchWithTimeout(`https://www.omdbapi.com/?${params}`);
-  const data = await response.json();
-  await incrementApiCalls();
-
-  if (isInvalidKeyError(data)) {
-    throw new Error('Invalid API key. Please update your key in the extension settings.');
-  }
-
-  if (data.Response === 'True') {
-    return data;
-  }
-
-  return null;
+  const data = await omdbFetch(params);
+  return data.Response === 'True' ? data : null;
 }
 
-// Exact search with year but try both movie and series
-async function exactSearchWithYear(apiKey, title, year) {
-  // Try movie first
-  const movieResult = await exactSearch(apiKey, title, year, 'movie');
-  if (movieResult) return movieResult;
+/** We have a year but not a type — try movie, then series. */
+async function searchBothTypes(apiKey, title, year) {
+  const movie = await exactSearch(apiKey, title, year, 'movie');
+  if (movie) return movie;
 
-  // Check rate limit before second call
-  if (await isRateLimited()) return null;
+  if (await isOverLimit()) return null;
 
-  // Try series
-  const seriesResult = await exactSearch(apiKey, title, year, 'series');
-  if (seriesResult) return seriesResult;
-
-  return null;
+  return exactSearch(apiKey, title, year, 'series');
 }
 
-// Smart search: use the OMDb search API to get multiple results,
-// then score them to find the best match
+/**
+ * Smart search — tries exact matches, then falls back to the OMDb
+ * search API and scores candidates by title-similarity, year proximity,
+ * and metadata quality.
+ */
 async function smartSearch(apiKey, title, year, mediaType) {
-  // Step 1: Try exact search first (it's the most reliable when it works)
-  const exactType = mediaType || 'movie';
-  const exactResult = await exactSearch(apiKey, title, year, exactType);
-  const exactIsGoodMatch = exactResult && isTitleMatch(title, exactResult.Title);
+  // Step 1 — exact match with preferred type
+  const preferredType = mediaType || 'movie';
+  const exact = await exactSearch(apiKey, title, year, preferredType);
+  const exactOk = exact && isTitleMatch(title, exact.Title);
 
-  if (exactIsGoodMatch) {
-    // Don't return yet — still try the alt type to see if there's a better match
+  // Step 2 — try the alternate type
+  if (!await isOverLimit()) {
+    const altType = preferredType === 'movie' ? 'series' : 'movie';
+    const alt = await exactSearch(apiKey, title, year, altType);
+    const altOk = alt && isTitleMatch(title, alt.Title);
+
+    if (altOk && exactOk) return pickBest(title, year, [exact, alt]);
+    if (altOk)            return alt;
   }
 
-  // Check rate limit before continuing
-  if (await isRateLimited()) return exactIsGoodMatch ? exactResult : null;
+  if (exactOk) return exact;
 
-  // Step 2: If exact search failed or returned a poor match, try the other type
-  const altType = (mediaType === 'series') ? 'movie' : 'series';
-  const altResult = await exactSearch(apiKey, title, year, altType);
-  if (altResult && isTitleMatch(title, altResult.Title)) {
-    if (exactIsGoodMatch) {
-      return pickBestMatch(title, year, [exactResult, altResult]);
-    }
-    return altResult;
-  }
+  // Step 3 — OMDb search API for broader matching
+  if (await isOverLimit()) return null;
 
-  // If exact was a good match and alt wasn't better, return exact
-  if (exactIsGoodMatch) return exactResult;
+  const searchParams = new URLSearchParams({ apikey: apiKey, s: title });
+  if (mediaType) searchParams.set('type', mediaType);
 
-  // Check rate limit before search API
-  if (await isRateLimited()) return null;
+  const searchData = await omdbFetch(searchParams);
+  if (searchData.Response !== 'True' || !searchData.Search?.length) return null;
 
-  // Step 3: Use the search API for broader matching
-  const searchParams = new URLSearchParams({
-    apikey: apiKey,
-    s: title,
-  });
-  if (mediaType) searchParams.append('type', mediaType);
+  const best = pickBest(title, year, searchData.Search);
+  if (!best) return null;
 
-  const searchResponse = await fetchWithTimeout(`https://www.omdbapi.com/?${searchParams}`);
-  const searchData = await searchResponse.json();
-  await incrementApiCalls();
+  // Fetch full details (search results don't include ratings)
+  if (await isOverLimit()) return null;
 
-  if (isInvalidKeyError(searchData)) {
-    throw new Error('Invalid API key. Please update your key in the extension settings.');
-  }
-
-  if (searchData.Response !== 'True' || !searchData.Search?.length) {
-    return null;
-  }
-
-  // Score candidates and pick the best one
-  const candidates = searchData.Search;
-  const bestCandidate = pickBestMatch(title, year, candidates);
-
-  if (!bestCandidate) return null;
-
-  // Check rate limit before fetching full details
-  if (await isRateLimited()) return null;
-
-  // Fetch full details for the best candidate (search results don't include ratings)
-  const detailParams = new URLSearchParams({
-    apikey: apiKey,
-    i: bestCandidate.imdbID,
-  });
-
-  const detailResponse = await fetchWithTimeout(`https://www.omdbapi.com/?${detailParams}`);
-  const detailData = await detailResponse.json();
-  await incrementApiCalls();
-
-  if (detailData.Response === 'True') {
-    return detailData;
-  }
-
-  return null;
+  const detail = await omdbFetch(new URLSearchParams({ apikey: apiKey, i: best.imdbID }));
+  return detail.Response === 'True' ? detail : null;
 }
 
-// ─── Matching & scoring ──────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+// TITLE MATCHING & SCORING
+// ═══════════════════════════════════════════════════════════════
 
-// Check if the OMDb result title is a reasonable match for our query
-function isTitleMatch(queryTitle, resultTitle) {
-  if (!queryTitle || !resultTitle) return false;
+function normalize(s) {
+  return s.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
+}
 
-  const normalize = (s) => s.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
-  const q = normalize(queryTitle);
-  const r = normalize(resultTitle);
+function isTitleMatch(query, result) {
+  if (!query || !result) return false;
+  const q = normalize(query);
+  const r = normalize(result);
 
-  // Exact match
   if (q === r) return true;
-
-  // One contains the other
   if (q.includes(r) || r.includes(q)) return true;
 
-  // Check word overlap (at least 70% of words match)
-  const qWords = q.split(' ').filter(w => w.length > 1);
-  const rWords = r.split(' ').filter(w => w.length > 1);
-  if (qWords.length === 0 || rWords.length === 0) return false;
+  const qw = q.split(' ').filter(w => w.length > 1);
+  const rw = r.split(' ').filter(w => w.length > 1);
+  if (!qw.length || !rw.length) return false;
 
-  const commonWords = qWords.filter(w => rWords.includes(w));
-  const overlapRatio = commonWords.length / Math.max(qWords.length, rWords.length);
-
-  return overlapRatio >= 0.7;
+  return qw.filter(w => rw.includes(w)).length / Math.max(qw.length, rw.length) >= 0.7;
 }
 
-// Pick the best match from a list of OMDb results
-function pickBestMatch(queryTitle, queryYear, candidates) {
-  if (!candidates || candidates.length === 0) return null;
-  if (candidates.length === 1) return candidates[0];
+function titleSimilarity(query, result) {
+  if (!query || !result) return 0;
+  const q = normalize(query);
+  const r = normalize(result);
 
-  const scored = candidates.map(candidate => {
-    let score = 0;
-
-    // Title similarity score (0-50 points)
-    score += titleSimilarityScore(queryTitle, candidate.Title) * 50;
-
-    // Year match (0-30 points)
-    if (queryYear && candidate.Year) {
-      const candidateYear = parseInt(candidate.Year);
-      const targetYear = parseInt(queryYear);
-      const yearDiff = Math.abs(candidateYear - targetYear);
-
-      if (yearDiff === 0) {
-        score += 30;
-      } else if (yearDiff === 1) {
-        score += 20; // Off by one year is common (production vs release)
-      } else if (yearDiff <= 3) {
-        score += 10;
-      }
-      // More than 3 years off: no year bonus
-    }
-
-    // Prefer entries with ratings available (0-10 points)
-    if (candidate.imdbRating && candidate.imdbRating !== 'N/A') {
-      score += 10;
-    }
-
-    // Prefer entries with a poster (indicates a real, well-known entry) (0-5 points)
-    if (candidate.Poster && candidate.Poster !== 'N/A') {
-      score += 5;
-    }
-
-    // Small bonus for movies (OMDb default, usually what Netflix users want) (0-5 points)
-    if (candidate.Type === 'movie') {
-      score += 3;
-    }
-
-    return { candidate, score };
-  });
-
-  // Sort by score descending
-  scored.sort((a, b) => b.score - a.score);
-
-  return scored[0].candidate;
-}
-
-// Compute title similarity as a ratio between 0 and 1
-function titleSimilarityScore(queryTitle, resultTitle) {
-  if (!queryTitle || !resultTitle) return 0;
-
-  const normalize = (s) => s.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
-  const q = normalize(queryTitle);
-  const r = normalize(resultTitle);
-
-  if (q === r) return 1.0;
-
-  // Check containment
+  if (q === r) return 1;
   if (q.includes(r) || r.includes(q)) {
-    const shorter = Math.min(q.length, r.length);
-    const longer = Math.max(q.length, r.length);
-    return 0.8 + (0.2 * shorter / longer);
+    return 0.8 + 0.2 * Math.min(q.length, r.length) / Math.max(q.length, r.length);
   }
 
-  // Word overlap ratio
-  const qWords = q.split(' ').filter(w => w.length > 1);
-  const rWords = r.split(' ').filter(w => w.length > 1);
-  if (qWords.length === 0 || rWords.length === 0) return 0;
+  const qw = q.split(' ').filter(w => w.length > 1);
+  const rw = r.split(' ').filter(w => w.length > 1);
+  if (!qw.length || !rw.length) return 0;
 
-  const commonWords = qWords.filter(w => rWords.includes(w));
-  return commonWords.length / Math.max(qWords.length, rWords.length);
+  return qw.filter(w => rw.includes(w)).length / Math.max(qw.length, rw.length);
 }
 
-// ─── Rate limit helpers ──────────────────────────────────────
+function pickBest(queryTitle, queryYear, candidates) {
+  if (!candidates?.length) return null;
+  if (candidates.length === 1) return candidates[0];
 
-async function isRateLimited() {
-  const count = await getApiCallCount();
-  return count >= API_DAILY_LIMIT;
+  let bestScore = -1;
+  let bestCandidate = null;
+
+  for (const c of candidates) {
+    let score = titleSimilarity(queryTitle, c.Title) * 50;
+
+    if (queryYear && c.Year) {
+      const diff = Math.abs(parseInt(c.Year) - parseInt(queryYear));
+      score += diff === 0 ? 30 : diff === 1 ? 20 : diff <= 3 ? 10 : 0;
+    }
+
+    if (c.imdbRating && c.imdbRating !== 'N/A') score += 10;
+    if (c.Poster   && c.Poster   !== 'N/A') score += 5;
+    if (c.Type === 'movie') score += 3;
+
+    if (score > bestScore) { bestScore = score; bestCandidate = c; }
+  }
+
+  return bestCandidate;
 }
 
-function isInvalidKeyError(data) {
-  return data.Response === 'False' && data.Error &&
-    data.Error.toLowerCase().includes('invalid api key');
-}
+// ═══════════════════════════════════════════════════════════════
+// DATA PROCESSING
+// ═══════════════════════════════════════════════════════════════
 
-// ─── Data processing ─────────────────────────────────────────
+async function processAndCache(cacheKey, data) {
+  const imdbRating     = data.imdbRating !== 'N/A' ? data.imdbRating : null;
+  const rottenTomatoes = extractRT(data.Ratings);
 
-async function processAndCacheRating(cacheKey, data) {
-  const imdbRating = (data.imdbRating && data.imdbRating !== 'N/A') ? data.imdbRating : null;
-  const rottenTomatoes = extractRottenTomatoes(data.Ratings);
+  if (!imdbRating && !rottenTomatoes) {
+    const miss = { notFound: true, title: data.Title, cachedAt: Date.now() };
+    await writeCache(cacheKey, miss);
+    return miss;
+  }
 
   const rating = {
     imdbRating,
     rottenTomatoes,
-    title: data.Title,
-    year: data.Year,
-    type: data.Type,
-    imdbID: data.imdbID,
-    cachedAt: Date.now()
+    title:    data.Title,
+    year:     data.Year,
+    type:     data.Type,
+    imdbID:   data.imdbID,
+    cachedAt: Date.now(),
   };
-
-  // If neither rating is available, treat as not found
-  if (!imdbRating && !rottenTomatoes) {
-    const notFoundResult = { notFound: true, title: data.Title, cachedAt: Date.now() };
-    await cacheRating(cacheKey, notFoundResult);
-    return notFoundResult;
-  }
-
-  await cacheRating(cacheKey, rating);
+  await writeCache(cacheKey, rating);
   return rating;
 }
 
-function extractRottenTomatoes(ratings) {
-  if (!ratings || !Array.isArray(ratings)) return null;
-  const rt = ratings.find(r => r.Source === 'Rotten Tomatoes');
-  return rt?.Value || null;
+function extractRT(ratings) {
+  if (!Array.isArray(ratings)) return null;
+  return ratings.find(r => r.Source === 'Rotten Tomatoes')?.Value ?? null;
 }
 
-// ─── Storage helpers ─────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+// HTTP HELPER
+// ═══════════════════════════════════════════════════════════════
 
-async function getApiKey() {
-  const result = await chrome.storage.local.get('apiKey');
-  return result.apiKey;
+async function omdbFetch(params) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+  try {
+    const res = await fetch(`https://www.omdbapi.com/?${params}`, { signal: controller.signal });
+    clearTimeout(timer);
+    const data = await res.json();
+    await incrementApiCalls();
+
+    if (data.Response === 'False' && data.Error?.toLowerCase().includes('invalid api key')) {
+      throw new Error('Invalid API key. Please update your key in the extension settings.');
+    }
+
+    return data;
+  } catch (err) {
+    clearTimeout(timer);
+    if (err.name === 'AbortError') {
+      throw new Error('Request timed out. OMDb API may be slow — please try again.');
+    }
+    throw err;
+  }
 }
 
-async function getCachedRating(key) {
+// ═══════════════════════════════════════════════════════════════
+// CACHE & STORAGE
+// ═══════════════════════════════════════════════════════════════
+
+async function getCached(key) {
   const result = await chrome.storage.local.get(key);
-  const cached = result[key];
+  const entry  = result[key];
+  if (!entry) return null;
 
-  if (!cached) return null;
-
-  if (Date.now() - cached.cachedAt > CACHE_TTL) {
+  if (Date.now() - entry.cachedAt > CACHE_TTL_MS) {
     await chrome.storage.local.remove(key);
     return null;
   }
-
-  return cached;
+  return entry;
 }
 
-async function cacheRating(key, data) {
-  // Prune periodically — use storage counter since service worker memory is ephemeral
-  const result = await chrome.storage.local.get('_nro_cacheWriteCount');
-  const count = (result._nro_cacheWriteCount || 0) + 1;
+async function writeCache(key, data) {
+  const { [PRUNE_COUNTER_KEY]: prev } = await chrome.storage.local.get(PRUNE_COUNTER_KEY);
+  const count = (prev || 0) + 1;
 
-  if (count >= PRUNE_CHECK_INTERVAL) {
-    // Batch data + counter reset in one write
-    await chrome.storage.local.set({ [key]: data, _nro_cacheWriteCount: 0 });
-    await pruneCache();
-  } else {
-    // Batch data + counter increment in one write
-    await chrome.storage.local.set({ [key]: data, _nro_cacheWriteCount: count });
-  }
+  await chrome.storage.local.set({
+    [key]: data,
+    [PRUNE_COUNTER_KEY]: count >= PRUNE_INTERVAL ? 0 : count,
+  });
+
+  if (count >= PRUNE_INTERVAL) await pruneCache();
 }
 
 async function pruneCache() {
-  const all = await chrome.storage.local.get(null);
-  const ratingKeys = Object.keys(all).filter(k => k.startsWith('rating_'));
+  const all  = await chrome.storage.local.get(null);
+  const now  = Date.now();
+  const toRemove = [];
+  const valid    = [];
 
-  const now = Date.now();
-  const expiredKeys = [];
-  const validEntries = [];
-
-  for (const key of ratingKeys) {
+  for (const key of Object.keys(all)) {
+    if (!key.startsWith(CACHE_KEY_PREFIX)) continue;
     const entry = all[key];
-    if (!entry?.cachedAt || now - entry.cachedAt > CACHE_TTL) {
-      expiredKeys.push(key);
+    if (!entry?.cachedAt || now - entry.cachedAt > CACHE_TTL_MS) {
+      toRemove.push(key);
     } else {
-      validEntries.push({ key, cachedAt: entry.cachedAt });
+      valid.push({ key, cachedAt: entry.cachedAt });
     }
   }
 
-  // Remove all expired entries
-  const toRemove = [...expiredKeys];
-
-  // Also trim to MAX_CACHE_SIZE by removing oldest valid entries
-  if (validEntries.length > MAX_CACHE_SIZE) {
-    validEntries.sort((a, b) => a.cachedAt - b.cachedAt);
-    const excess = validEntries.slice(0, validEntries.length - MAX_CACHE_SIZE);
-    toRemove.push(...excess.map(e => e.key));
+  if (valid.length > MAX_CACHE_SIZE) {
+    valid.sort((a, b) => a.cachedAt - b.cachedAt);
+    for (const e of valid.slice(0, valid.length - MAX_CACHE_SIZE)) {
+      toRemove.push(e.key);
+    }
   }
 
-  if (toRemove.length > 0) {
-    await chrome.storage.local.remove(toRemove);
-  }
+  if (toRemove.length) await chrome.storage.local.remove(toRemove);
 }
+
+// ═══════════════════════════════════════════════════════════════
+// RATE-LIMIT TRACKING
+// ═══════════════════════════════════════════════════════════════
 
 async function getApiCallCount() {
   const today = new Date().toDateString();
-  const result = await chrome.storage.local.get(['apiCallsToday', 'apiCallsDate']);
-
-  if (result.apiCallsDate === today) {
-    return result.apiCallsToday || 0;
-  }
-  return 0;
+  const { apiCallsToday, apiCallsDate } = await chrome.storage.local.get(['apiCallsToday', 'apiCallsDate']);
+  return apiCallsDate === today ? (apiCallsToday || 0) : 0;
 }
 
-// Simple async lock to prevent TOCTOU races on API call counter
-let _apiCountLock = null;
+async function isOverLimit() {
+  return (await getApiCallCount()) >= API_DAILY_LIMIT;
+}
+
+// Simple lock to serialise concurrent increments
+let _counterLock = null;
 
 async function incrementApiCalls() {
-  // Wait for any in-flight increment to finish
-  while (_apiCountLock) {
-    await _apiCountLock;
-  }
+  while (_counterLock) await _counterLock;
 
-  let resolve;
-  _apiCountLock = new Promise(r => { resolve = r; });
+  let unlock;
+  _counterLock = new Promise(r => { unlock = r; });
 
   try {
     const today = new Date().toDateString();
-    const result = await chrome.storage.local.get(['apiCallsToday', 'apiCallsDate']);
-
-    let count;
-    if (result.apiCallsDate === today) {
-      count = (result.apiCallsToday || 0) + 1;
-    } else {
-      count = 1;
-    }
+    const { apiCallsToday, apiCallsDate } = await chrome.storage.local.get(['apiCallsToday', 'apiCallsDate']);
+    const count = apiCallsDate === today ? (apiCallsToday || 0) + 1 : 1;
 
     await chrome.storage.local.set({ apiCallsToday: count, apiCallsDate: today });
 
     if (count === API_WARN_THRESHOLD) {
-      console.warn(`[Netflix Ratings] Approaching daily API limit: ${count}/${API_DAILY_LIMIT} calls used.`);
+      console.warn(`[NRO] Approaching daily API limit: ${count}/${API_DAILY_LIMIT}`);
     }
   } finally {
-    _apiCountLock = null;
-    resolve();
+    _counterLock = null;
+    unlock();
   }
 }

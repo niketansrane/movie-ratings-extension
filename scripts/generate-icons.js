@@ -134,7 +134,7 @@ function makeCRCTable() {
 
 // Generate icons
 const sizes = [16, 48, 128];
-const iconsDir = path.join(__dirname, 'icons');
+const iconsDir = path.join(__dirname, '..', 'icons');
 
 sizes.forEach(size => {
   const png = createPNG(size);

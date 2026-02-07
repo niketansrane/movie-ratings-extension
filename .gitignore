@@ -1,20 +1,25 @@
 # Dependencies
 node_modules/
 
-# Build artifacts
-*.zip
+# Build output
 dist/
+*.zip
 
-# IDE
+# IDE / editor
 .idea/
 .vscode/
 *.swp
 *.swo
+*.code-workspace
 
 # OS
 .DS_Store
 Thumbs.db
+desktop.ini
 
-# Temporary files
+# Logs
 *.log
 *.tmp
+
+# Package lock (no dependencies to lock)
+package-lock.json

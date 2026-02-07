@@ -1,130 +1,157 @@
-# Movie Ratings Extension
+# Netflix Ratings Overlay
 
-A Chrome extension that displays IMDb and Rotten Tomatoes ratings when you hover over movie and TV show posters on streaming platforms.
+> See IMDb and Rotten Tomatoes ratings instantly when you hover over any movie or TV show on Netflix — no tab-switching needed.
 
-![Chrome Extension](https://img.shields.io/badge/Chrome-Extension-green) ![Manifest V3](https://img.shields.io/badge/Manifest-V3-blue)
-
-## Demo
+![Chrome Extension](https://img.shields.io/badge/Platform-Chrome-green?logo=googlechrome&logoColor=white)
+![Manifest V3](https://img.shields.io/badge/Manifest-V3-blue)
+![License](https://img.shields.io/badge/License-MIT-yellow)
 
 ![Movie Ratings Extension Demo](assets/demo.gif)
 
-[Watch full video demo](assets/demo.mp4)
-
 ## Features
 
-- **IMDb Ratings** - See the IMDb score (e.g., 7.3/10)
-- **Rotten Tomatoes** - See the Tomatometer percentage with fresh/rotten indicator
-- **Hover to View** - Ratings appear when you hover over any movie poster
-- **Smart Caching** - Ratings are cached for 7 days to minimize API calls
-- **Non-intrusive** - Clean, minimal overlay that doesn't block content
-
-## Supported Platforms
-
-- Netflix (more platforms coming soon)
+| Feature | Description |
+|---------|-------------|
+| **IMDb Ratings** | Gold badge showing the IMDb score (e.g. 7.3) |
+| **Rotten Tomatoes** | Red (Fresh ≥ 60%) or gray (Rotten < 60%) badge |
+| **Hero Banner** | Works on the large featured banner at the top of Netflix |
+| **Poster Cards** | Works on all small poster cards in browse rows |
+| **Smart Caching** | Ratings cached for 7 days — fast & API-friendly |
+| **Hover to View** | Non-intrusive — only appears when you hover |
+| **Top-Left Anchor** | Badges always appear at the top-left corner of the poster |
 
 ## Installation
 
-### Step 1: Download the Extension
+### 1. Get the extension
 
 ```bash
 git clone https://github.com/niketansrane/movie-ratings-extension.git
 ```
 
-Or download and extract the ZIP file from this repository.
+### 2. Get a free OMDb API key
 
-### Step 2: Get an OMDb API Key
+1. Go to [omdbapi.com/apikey.aspx](https://www.omdbapi.com/apikey.aspx)
+2. Choose the **FREE** tier (1,000 requests/day)
+3. Enter your email → check inbox → activate
 
-1. Go to [OMDb API](https://www.omdbapi.com/apikey.aspx)
-2. Select the **FREE** tier (1,000 requests/day)
-3. Enter your email and submit
-4. Check your email and activate your API key
+### 3. Load in Chrome
 
-### Step 3: Load the Extension in Chrome
+1. Navigate to `chrome://extensions/`
+2. Enable **Developer mode** (top-right toggle)
+3. Click **Load unpacked** → select the `movie-ratings-extension` folder
 
-1. Open Chrome and navigate to `chrome://extensions/`
-2. Enable **Developer mode** (toggle in the top-right corner)
-3. Click **Load unpacked**
-4. Select the `movie-ratings-extension` folder you downloaded
-
-### Step 4: Configure Your API Key
+### 4. Configure
 
 1. Click the extension icon in Chrome's toolbar
-2. Enter your OMDb API key in the settings popup
+2. Paste your OMDb API key
 3. Click **Save**
 
 ## Usage
 
-1. Go to [Netflix](https://www.netflix.com)
-2. Hover over any movie or TV show poster
-3. Wait briefly (~300ms) for the rating badges to appear
-4. Ratings display at the top-left corner of the poster
+1. Open [netflix.com](https://www.netflix.com)
+2. Hover over any movie poster or the hero banner
+3. Rating badges appear at the top-left corner after ~300 ms
 
-### Rating Badges
+### Badge Guide
 
 | Badge | Meaning |
 |-------|---------|
-| **IMDb 7.3** | IMDb rating out of 10 |
-| **RT 85%** (red) | Rotten Tomatoes "Fresh" (60%+) |
-| **RT 45%** (gray) | Rotten Tomatoes "Rotten" (<60%) |
+| **IMDb 7.3** (gold) | IMDb rating out of 10 |
+| **RT 85%** (red) | Rotten Tomatoes "Fresh" (≥ 60%) |
+| **RT 42%** (gray) | Rotten Tomatoes "Rotten" (< 60%) |
 
-If no ratings are available, no badge is shown.
+No badge = no rating data available for that title.
 
-## Extension Popup
-
-Click the extension icon to:
-
-- **Enable/Disable** - Toggle the extension on or off
-- **Update API Key** - Change your OMDb API key
-- **View Stats** - See cache statistics and API usage
-
-## Troubleshooting
-
-### Ratings not appearing?
-
-1. **Check API Key** - Click the extension icon and verify your API key is saved
-2. **Check Console** - Open DevTools (F12) and look for `[Netflix Ratings]` logs
-3. **Refresh Page** - After installing or updating, refresh the Netflix page
-4. **Extension Enabled** - Make sure the toggle in the popup is ON
-
-### "Extension context invalidated" error?
-
-This happens when the extension is updated or reloaded. Simply refresh the Netflix page.
-
-### API limit reached?
-
-The free OMDb tier allows 1,000 requests/day. Ratings are cached for 7 days, so normal usage stays well under this limit.
-
-## Development
-
-### Project Structure
+## Project Structure
 
 ```
 movie-ratings-extension/
-├── manifest.json           # Extension configuration
+├── manifest.json                  # Chrome extension config (MV3)
+├── package.json                   # Project metadata & scripts
+├── LICENSE                        # MIT license
+├── PRIVACY.md                     # Privacy policy
+│
 ├── src/
 │   ├── background/
-│   │   └── service-worker.js   # API calls and caching
+│   │   └── service-worker.js      # OMDb API, caching, rate limiting
 │   ├── content/
-│   │   ├── content.js      # DOM interaction and overlay
-│   │   └── styles.css      # Rating badge styles
-│   └── popup/
-│       ├── popup.html      # Settings UI
-│       ├── popup.js        # Settings logic
-│       └── popup.css       # Popup styles
-├── icons/                  # Extension icons
-└── generate-icons.js       # Icon generation script
+│   │   ├── content.js             # DOM detection, hover handling, overlay
+│   │   └── styles.css             # Rating badge styles
+│   ├── popup/
+│   │   ├── popup.html             # Settings UI
+│   │   ├── popup.js               # Settings logic
+│   │   └── popup.css              # Popup styles
+│   └── constants/
+│       └── config.js              # Shared constants reference
+│
+├── icons/                         # Extension icons (16/48/128 px)
+├── scripts/
+│   ├── generate-icons.js          # Icon generator
+│   └── package.js                 # Build .zip for Chrome Web Store
+│
+├── assets/                        # Demo screenshots / videos
+└── docs/plans/                    # Feature planning docs
 ```
 
-### Generate Icons
+## Architecture
+
+```
+┌──────────────────┐    chrome.runtime     ┌──────────────────┐
+│   Content Script  │ ──── sendMessage ───▶ │  Service Worker   │
+│   (netflix.com)   │ ◀── response ─────── │  (background)     │
+│                   │                       │                   │
+│  • Detect hover   │                       │  • OMDb API calls │
+│  • Extract title  │                       │  • Smart search   │
+│  • Render badges  │                       │  • Caching        │
+│  • Position overlay│                      │  • Rate limiting  │
+└──────────────────┘                       └──────────────────┘
+         │                                          │
+         └──────── chrome.storage.local ────────────┘
+                   (cache + settings)
+```
+
+## Popup Settings
+
+| Control | Function |
+|---------|----------|
+| **API Key** | Your OMDb API key (stored locally, never shared) |
+| **Enable/Disable** | Toggle the extension on/off instantly |
+| **Cached** | Number of ratings currently cached |
+| **API calls today** | Today's OMDb API usage (limit: 1,000) |
+| **Clear Cache** | Remove all cached ratings |
+
+## Scripts
 
 ```bash
-node generate-icons.js
+node scripts/generate-icons.js   # Regenerate extension icons
+node scripts/package.js           # Build .zip for Chrome Web Store upload
 ```
 
-## License
+## Troubleshooting
 
-MIT
+| Problem | Solution |
+|---------|----------|
+| No ratings appear | Check API key in popup → make sure it's saved and valid |
+| "Extension context invalidated" | Refresh the Netflix page |
+| API limit reached | Free tier = 1,000/day. Cached ratings don't count. Wait until tomorrow. |
+| Ratings wrong for a title | OMDb occasionally returns wrong matches for ambiguous titles |
+| Extension icon grayed out | Make sure you're on `netflix.com` and the extension is enabled |
+
+## Privacy
+
+This extension:
+
+- ✅ Only communicates with `omdbapi.com` to fetch ratings
+- ✅ Stores everything locally on your device (`chrome.storage.local`)
+- ❌ Does **not** collect personal data, analytics, or telemetry
+- ❌ Does **not** access your Netflix account or viewing history
+
+Full details: [PRIVACY.md](PRIVACY.md)
 
 ## Contributing
 
-Contributions are welcome! Feel free to open issues or submit pull requests.
+Contributions are welcome! Please open an issue first to discuss what you'd like to change.
+
+## License
+
+[MIT](LICENSE)

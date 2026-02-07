@@ -1,154 +1,147 @@
-// Popup script for Netflix Ratings Extension
+'use strict';
+
+/**
+ * Popup Script — Netflix Ratings Overlay
+ *
+ * Manages the extension settings popup: API key configuration,
+ * enable/disable toggle, cache stats, and cache clearing.
+ */
+
+const VALIDATE_TIMEOUT_MS = 8000;
+const STATUS_DISPLAY_MS   = 3000;
+const API_KEY_PATTERN     = /^[a-zA-Z0-9]+$/;
+
+let statusTimer = null;
+
+// ─── Bootstrap ────────────────────────────────────────────────
 
 document.addEventListener('DOMContentLoaded', async () => {
-  // Load saved settings
-  const settings = await chrome.storage.local.get([
-    'apiKey', 'enabled', 'apiCallsToday', 'apiCallsDate'
-  ]);
+  const settings = await chrome.storage.local.get(['apiKey', 'enabled']);
 
-  document.getElementById('apiKey').value = settings.apiKey || '';
+  document.getElementById('apiKey').value   = settings.apiKey || '';
   document.getElementById('enabled').checked = settings.enabled !== false;
 
-  // Update stats
-  await updateStats();
+  await refreshStats();
 
-  // Event listeners
-  document.getElementById('save').addEventListener('click', saveSettings);
-  document.getElementById('clearCache').addEventListener('click', clearCache);
-  document.getElementById('toggleVisibility').addEventListener('click', togglePasswordVisibility);
-  document.getElementById('enabled').addEventListener('change', toggleEnabled);
+  document.getElementById('save').addEventListener('click', onSave);
+  document.getElementById('clearCache').addEventListener('click', onClearCache);
+  document.getElementById('toggleVisibility').addEventListener('click', onToggleVisibility);
+  document.getElementById('enabled').addEventListener('change', onToggleEnabled);
 });
 
-async function saveSettings() {
-  const apiKey = document.getElementById('apiKey').value.trim();
-  const enabled = document.getElementById('enabled').checked;
+// ─── Save settings ───────────────────────────────────────────
+
+async function onSave() {
+  const apiKey  = document.getElementById('apiKey').value.trim();
+  const enabledEl = document.getElementById('enabled');
   const saveBtn = document.getElementById('save');
 
   if (!apiKey) {
-    showStatus('Please enter an API key', 'error');
+    showStatus('Please enter an API key.', 'error');
     return;
   }
 
-  // Disable button during validation to prevent double-clicks
-  saveBtn.disabled = true;
-  saveBtn.textContent = 'Saving...';
+  if (!API_KEY_PATTERN.test(apiKey)) {
+    showStatus('API key should only contain letters and numbers.', 'error');
+    return;
+  }
 
-  // Validate API key by making a test request
-  showStatus('Validating API key...', 'info');
+  saveBtn.disabled    = true;
+  saveBtn.textContent = 'Validating…';
+  showStatus('Validating API key…', 'info');
 
   try {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 8000);
-    const response = await fetch(`https://www.omdbapi.com/?apikey=${apiKey}&t=inception`, {
-      signal: controller.signal
-    });
-    clearTimeout(timer);
-    const data = await response.json();
+    const timer = setTimeout(() => controller.abort(), VALIDATE_TIMEOUT_MS);
 
-    // Issue #10: Better detection of invalid API keys
-    if (data.Response === 'False' && data.Error) {
-      if (data.Error.toLowerCase().includes('invalid api key')) {
-        showStatus('Invalid API key. Please check and try again.', 'error');
-        return;
-      }
+    const res  = await fetch(
+      `https://www.omdbapi.com/?apikey=${encodeURIComponent(apiKey)}&t=inception`,
+      { signal: controller.signal }
+    );
+    clearTimeout(timer);
+    const data = await res.json();
+
+    if (data.Response === 'False' && data.Error?.toLowerCase().includes('invalid api key')) {
+      showStatus('Invalid API key. Please check and try again.', 'error');
+      return;
     }
 
-    await chrome.storage.local.set({ apiKey, enabled });
+    await chrome.storage.local.set({ apiKey, enabled: enabledEl.checked });
     showStatus('Settings saved!', 'success');
-  } catch (error) {
-    // Save anyway if network error (key might still be valid)
-    await chrome.storage.local.set({ apiKey, enabled });
-    showStatus('Saved (could not validate — network error)', 'success');
+  } catch (err) {
+    // Network error — save anyway; key might still be valid
+    await chrome.storage.local.set({ apiKey, enabled: enabledEl.checked });
+    showStatus('Saved (could not validate — network error).', 'success');
   } finally {
-    saveBtn.disabled = false;
+    saveBtn.disabled    = false;
     saveBtn.textContent = 'Save';
   }
 }
 
-// Issue #9: Toggle writes to storage; content script listens via
-// chrome.storage.onChanged to react immediately.
-async function toggleEnabled(event) {
-  const enabled = event.target.checked;
-  await chrome.storage.local.set({ enabled });
+// ─── Toggle enabled ──────────────────────────────────────────
 
-  if (enabled) {
-    showStatus('Extension enabled', 'success');
-  } else {
-    showStatus('Extension disabled', 'info');
-  }
+async function onToggleEnabled(e) {
+  const on = e.target.checked;
+  await chrome.storage.local.set({ enabled: on });
+  showStatus(on ? 'Extension enabled.' : 'Extension disabled.', on ? 'success' : 'info');
 }
 
-async function clearCache() {
-  const all = await chrome.storage.local.get(null);
-  const ratingKeys = Object.keys(all).filter(k => k.startsWith('rating_'));
+// ─── Clear cache ─────────────────────────────────────────────
 
-  if (ratingKeys.length === 0) {
-    showStatus('Cache is already empty', 'info');
+async function onClearCache() {
+  const all = await chrome.storage.local.get(null);
+  const keys = Object.keys(all).filter(k => k.startsWith('rating_'));
+
+  if (!keys.length) {
+    showStatus('Cache is already empty.', 'info');
     return;
   }
 
-  await chrome.storage.local.remove(ratingKeys);
-  // Also reset the cache write counter
+  await chrome.storage.local.remove(keys);
   await chrome.storage.local.set({ _nro_cacheWriteCount: 0 });
-  await updateStats();
-  showStatus(`Cleared ${ratingKeys.length} cached ratings`, 'success');
+  await refreshStats();
+  showStatus(`Cleared ${keys.length} cached ratings.`, 'success');
 }
 
-async function updateStats() {
-  const all = await chrome.storage.local.get(null);
-  const ratingKeys = Object.keys(all).filter(k => k.startsWith('rating_'));
+// ─── Stats ───────────────────────────────────────────────────
 
-  document.getElementById('cacheCount').textContent = ratingKeys.length;
+async function refreshStats() {
+  const all   = await chrome.storage.local.get(null);
+  const count = Object.keys(all).filter(k => k.startsWith('rating_')).length;
 
-  // API calls tracking
+  document.getElementById('cacheCount').textContent = count;
+
   const today = new Date().toDateString();
-  if (all.apiCallsDate === today) {
-    const calls = all.apiCallsToday || 0;
-    document.getElementById('apiCalls').textContent = calls;
-
-    // Warn if approaching limit
-    if (calls >= 900) {
-      document.getElementById('apiCalls').style.color = '#dc3545';
-    } else {
-      document.getElementById('apiCalls').style.color = '';
-    }
-  } else {
-    document.getElementById('apiCalls').textContent = '0';
-  }
+  const calls = all.apiCallsDate === today ? (all.apiCallsToday || 0) : 0;
+  const el    = document.getElementById('apiCalls');
+  el.textContent  = calls;
+  el.style.color  = calls >= 900 ? '#dc3545' : '';
 }
 
-function togglePasswordVisibility() {
+// ─── Password visibility toggle ─────────────────────────────
+
+function onToggleVisibility() {
   const input = document.getElementById('apiKey');
-  const eyeIcon = document.getElementById('eyeIcon');
+  const icon  = document.getElementById('eyeIcon');
 
-  if (input.type === 'password') {
-    input.type = 'text';
-    eyeIcon.innerHTML = `
-      <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path>
-      <line x1="1" y1="1" x2="23" y2="23"></line>
-    `;
-  } else {
-    input.type = 'password';
-    eyeIcon.innerHTML = `
-      <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
-      <circle cx="12" cy="12" r="3"></circle>
-    `;
-  }
+  const showing = input.type === 'text';
+  input.type = showing ? 'password' : 'text';
+
+  icon.innerHTML = showing
+    ? '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle>'
+    : '<path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path><line x1="1" y1="1" x2="23" y2="23"></line>';
 }
 
-let statusTimer = null;
+// ─── Status display ─────────────────────────────────────────
 
 function showStatus(message, type) {
-  const status = document.getElementById('status');
-  status.textContent = message;
-  status.className = `status ${type}`;
+  const el = document.getElementById('status');
+  el.textContent = message;
+  el.className   = `status ${type}`;
 
-  // Clear any previous auto-hide timer
   if (statusTimer) clearTimeout(statusTimer);
-
-  // Auto-hide after 3 seconds
   statusTimer = setTimeout(() => {
-    status.className = 'status';
-    statusTimer = null;
-  }, 3000);
+    el.className = 'status';
+    statusTimer  = null;
+  }, STATUS_DISPLAY_MS);
 }
