@@ -3,8 +3,8 @@
 
 const DEBOUNCE_MS = 300;
 const HIDE_DELAY_MS = 600;
-const POSITION_UPDATE_MS = 200; // Interval for repositioning overlay to track animations
-const DEBUG = false; // Issue #14: Disabled for production
+const POSITION_UPDATE_MS = 200;
+const DEBUG = false;
 
 let hoverTimeout = null;
 let hideTimeout = null;
@@ -16,14 +16,11 @@ let lastMouseX = 0;
 let lastMouseY = 0;
 let extensionEnabled = true;
 
-// Issue #3: Track initialization state to prevent duplicate setup
 let initialized = false;
 let mutationObserver = null;
 let urlObserver = null;
 let attachScanTimeout = null;
 let attachScanTimeout2 = null;
-
-// Issue #4: Debounce full-body scans from MutationObserver
 let pendingBodyScan = null;
 
 function log(...args) {
@@ -50,13 +47,20 @@ function createFloatingOverlay() {
   return floatingOverlay;
 }
 
-// ─── Title extraction ─────────────────────────────────────────
+// ─── Title & metadata extraction ──────────────────────────────
 
-// Issue #5: Use a curated list of Netflix-specific selectors only.
-// Removed overly broad selectors like [class*="title"], h1, h2, h3
-// that match section headers and navigation elements.
+// Extract comprehensive metadata from the Netflix DOM element to
+// improve OMDb matching accuracy. We gather: title, year, mediaType,
+// and Netflix video ID when available.
 function extractTitleFromElement(element) {
-  // Strategy 1: aria-label on the element or ancestors
+  let title = null;
+  let year = null;
+  let mediaType = null; // null = unknown, let service worker figure it out
+
+  // ── Extract Netflix video ID from links ──
+  const netflixId = extractNetflixId(element);
+
+  // ── Strategy 1: aria-label (richest source — often has year, season info) ──
   let ariaLabel = element.getAttribute('aria-label');
   if (!ariaLabel) {
     const parent = element.closest('[aria-label]');
@@ -64,53 +68,159 @@ function extractTitleFromElement(element) {
   }
   if (ariaLabel && ariaLabel.length > 2 && !isNonTitleLabel(ariaLabel)) {
     log('Found aria-label:', ariaLabel);
-    return parseAriaLabel(ariaLabel);
+    const parsed = parseAriaLabel(ariaLabel);
+    title = parsed.title;
+    year = parsed.year;
+    mediaType = parsed.mediaType;
   }
 
-  // Strategy 2: Image alt text
-  const img = element.querySelector('img[alt]') ||
-              element.closest('.title-card-container, .slider-item')?.querySelector('img[alt]');
-  if (img?.alt && img.alt.length > 2 && !isNonTitleLabel(img.alt)) {
-    log('Found img alt:', img.alt);
-    return { title: img.alt.trim(), mediaType: 'movie' };
+  // ── Strategy 2: Image alt text ──
+  if (!title) {
+    const img = element.querySelector('img[alt]') ||
+                element.closest('.title-card-container, .slider-item')?.querySelector('img[alt]');
+    if (img?.alt && img.alt.length > 2 && !isNonTitleLabel(img.alt)) {
+      log('Found img alt:', img.alt);
+      title = img.alt.trim();
+    }
   }
 
-  // Strategy 3: Netflix-specific title selectors only (no generic h1/h2/h3)
-  const titleSelectors = [
-    '.fallback-text',
-    '.title-card-title',
-    '.previewModal-player-titleTreatment-logo',
-    '.previewModal-title',
-    '.bob-title',
-  ];
+  // ── Strategy 3: Netflix-specific title selectors ──
+  if (!title) {
+    const titleSelectors = [
+      '.fallback-text',
+      '.title-card-title',
+      '.previewModal-player-titleTreatment-logo',
+      '.previewModal-title',
+      '.bob-title',
+    ];
 
-  for (const selector of titleSelectors) {
-    const titleEl = element.querySelector(selector);
-    if (titleEl) {
-      if (titleEl.tagName === 'IMG' && titleEl.alt) {
-        log('Found title via logo alt', selector, ':', titleEl.alt);
-        return { title: titleEl.alt.trim(), mediaType: 'movie' };
-      }
-      const text = titleEl.textContent?.trim();
-      if (text && text.length > 2 && text.length < 100 && !isNonTitleLabel(text)) {
-        log('Found title via selector', selector, ':', text);
-        return { title: text, mediaType: 'movie' };
+    for (const selector of titleSelectors) {
+      const titleEl = element.querySelector(selector);
+      if (titleEl) {
+        if (titleEl.tagName === 'IMG' && titleEl.alt) {
+          log('Found title via logo alt', selector, ':', titleEl.alt);
+          title = titleEl.alt.trim();
+          break;
+        }
+        const text = titleEl.textContent?.trim();
+        if (text && text.length > 2 && text.length < 100 && !isNonTitleLabel(text)) {
+          log('Found title via selector', selector, ':', text);
+          title = text;
+          break;
+        }
       }
     }
   }
 
-  // Strategy 4: Look in preview modal ancestors (for expanded cards)
-  const previewModal = element.closest('[class*="previewModal"], [class*="jawBone"], .bob-card, .mini-modal');
-  if (previewModal) {
-    for (const selector of ['.previewModal-player-titleTreatment-logo', '.previewModal-title', '.bob-title']) {
-      const titleEl = previewModal.querySelector(selector);
-      if (titleEl) {
-        if (titleEl.tagName === 'IMG' && titleEl.alt) {
-          return { title: titleEl.alt.trim(), mediaType: 'movie' };
+  // ── Strategy 4: Look in preview modal ancestors ──
+  if (!title) {
+    const previewModal = element.closest('[class*="previewModal"], [class*="jawBone"], .bob-card, .mini-modal');
+    if (previewModal) {
+      for (const selector of ['.previewModal-player-titleTreatment-logo', '.previewModal-title', '.bob-title']) {
+        const titleEl = previewModal.querySelector(selector);
+        if (titleEl) {
+          if (titleEl.tagName === 'IMG' && titleEl.alt) {
+            title = titleEl.alt.trim();
+            break;
+          }
+          const text = titleEl.textContent?.trim();
+          if (text && text.length > 2 && text.length < 100) {
+            title = text;
+            break;
+          }
         }
-        const text = titleEl.textContent?.trim();
-        if (text && text.length > 2 && text.length < 100) {
-          return { title: text, mediaType: 'movie' };
+      }
+    }
+  }
+
+  if (!title) return null;
+
+  // ── Now try to enrich year and mediaType from DOM if not already set ──
+
+  // Try to extract year from nearby DOM elements
+  if (!year) {
+    year = extractYearFromDOM(element);
+  }
+
+  // Try to detect series vs movie from DOM clues
+  if (!mediaType || mediaType === 'movie') {
+    const detectedType = detectMediaTypeFromDOM(element);
+    if (detectedType) {
+      mediaType = detectedType;
+    }
+  }
+
+  return {
+    title,
+    year,
+    mediaType: mediaType || null, // null = let service worker search both
+    netflixId
+  };
+}
+
+// Extract Netflix video ID from <a href="/watch/12345"> links
+function extractNetflixId(element) {
+  // Check for a link with /watch/ or /title/ in the href
+  const link = element.querySelector('a[href*="/watch/"], a[href*="/title/"]') ||
+               element.closest('a[href*="/watch/"], a[href*="/title/"]');
+
+  if (link) {
+    const href = link.getAttribute('href') || '';
+    const match = href.match(/\/(?:watch|title)\/(\d+)/);
+    if (match) {
+      log('Found Netflix ID:', match[1]);
+      return match[1];
+    }
+  }
+
+  // Also check data attributes that Netflix sometimes uses
+  const dataId = element.getAttribute('data-id') ||
+                 element.getAttribute('data-video-id') ||
+                 element.closest('[data-id]')?.getAttribute('data-id') ||
+                 element.closest('[data-video-id]')?.getAttribute('data-video-id');
+  if (dataId) {
+    log('Found Netflix data ID:', dataId);
+    return dataId;
+  }
+
+  return null;
+}
+
+// Try to find a year in the DOM near the hovered element
+function extractYearFromDOM(element) {
+  // Search within the element and its preview modal for year-like text
+  const searchRoots = [element];
+  const previewModal = element.closest('[class*="previewModal"], [class*="jawBone"], .bob-card, .mini-modal');
+  if (previewModal) searchRoots.push(previewModal);
+
+  for (const root of searchRoots) {
+    // Look in supplemental/metadata text elements
+    const metaSelectors = [
+      '.year',
+      '[class*="year"]',
+      '.duration',
+      '[class*="duration"]',
+      '.meta',
+      '[class*="meta"]',
+      '.supplemental-message',
+      '[class*="supplemental"]',
+      '.videoMetadata',
+      '[class*="videoMetadata"]',
+      '.previewModal--detailsMetadata-left',
+      '[class*="detailsMetadata"]',
+    ];
+
+    for (const sel of metaSelectors) {
+      const els = root.querySelectorAll(sel);
+      for (const el of els) {
+        const text = el.textContent?.trim();
+        if (text) {
+          // Match a standalone 4-digit year (1900-2099)
+          const yearMatch = text.match(/\b(19\d{2}|20\d{2})\b/);
+          if (yearMatch) {
+            log('Found year from DOM metadata:', yearMatch[1], 'in selector:', sel);
+            return yearMatch[1];
+          }
         }
       }
     }
@@ -119,7 +229,61 @@ function extractTitleFromElement(element) {
   return null;
 }
 
-// Filter out non-title aria-labels and text
+// Detect whether this is a series or movie from DOM clues
+function detectMediaTypeFromDOM(element) {
+  const searchRoots = [element];
+  const previewModal = element.closest('[class*="previewModal"], [class*="jawBone"], .bob-card, .mini-modal');
+  if (previewModal) searchRoots.push(previewModal);
+
+  for (const root of searchRoots) {
+    const textContent = root.textContent || '';
+
+    // Look for series indicators
+    if (/\b(Season|Episode|Series|Limited Series|Episodes)\b/i.test(textContent)) {
+      // Make sure it's from metadata, not from a title like "American Horror Story"
+      const metaSelectors = [
+        '.duration', '[class*="duration"]',
+        '.meta', '[class*="meta"]',
+        '.supplemental-message', '[class*="supplemental"]',
+        '.episodeSelector', '[class*="episode"]',
+        '.previewModal--detailsMetadata-left', '[class*="detailsMetadata"]',
+      ];
+
+      for (const sel of metaSelectors) {
+        const els = root.querySelectorAll(sel);
+        for (const el of els) {
+          const metaText = el.textContent || '';
+          if (/\b(Season|Episode|Series|Limited Series|Episodes)\b/i.test(metaText)) {
+            log('Detected series from DOM metadata:', sel);
+            return 'series';
+          }
+        }
+      }
+    }
+
+    // Look for movie indicators (duration like "1h 30m" or "2h 15m")
+    const metaSelectors = [
+      '.duration', '[class*="duration"]',
+      '.meta', '[class*="meta"]',
+      '.supplemental-message', '[class*="supplemental"]',
+      '.previewModal--detailsMetadata-left', '[class*="detailsMetadata"]',
+    ];
+
+    for (const sel of metaSelectors) {
+      const els = root.querySelectorAll(sel);
+      for (const el of els) {
+        const metaText = el.textContent || '';
+        if (/\b\d+h\s*\d*m?\b/i.test(metaText)) {
+          log('Detected movie from duration format:', sel);
+          return 'movie';
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
 function isNonTitleLabel(text) {
   const lower = text.toLowerCase();
   const skipWords = ['account', 'profile', 'search', 'menu', 'navigation',
@@ -135,7 +299,7 @@ function parseAriaLabel(label) {
 
   let title = label;
   let year = null;
-  let mediaType = 'movie';
+  let mediaType = null;
 
   if (yearMatch) {
     year = yearMatch[1];
@@ -155,8 +319,6 @@ function parseAriaLabel(label) {
   return { title, year, mediaType };
 }
 
-// Issue #8: Preserve characters that are meaningful for OMDb searches
-// Only collapse whitespace and trim — keep hyphens, apostrophes, colons, etc.
 function normalizeTitle(title) {
   return title
     .replace(/\s+/g, ' ')
@@ -187,8 +349,6 @@ function showFloatingOverlay(element, data) {
 
   positionOverlay(element);
   overlay.style.opacity = '1';
-
-  // Issue #6: Start interval to reposition overlay as Netflix animates the element
   startPositionTracking(element);
 }
 
@@ -221,7 +381,6 @@ function positionOverlay(element) {
   floatingOverlay.style.top = `${top}px`;
 }
 
-// Issue #6: Periodically reposition overlay to follow animated poster elements
 function startPositionTracking(element) {
   stopPositionTracking();
   positionInterval = setInterval(() => {
@@ -291,8 +450,6 @@ function handleMouseEnter(event) {
   }, DEBOUNCE_MS);
 }
 
-// Issue #1: Improved mouseleave handling for Netflix's DOM-replacing animations.
-// Uses a longer delay and checks whether we're now over a related Netflix element.
 function handleMouseLeave(event) {
   clearTimeout(hoverTimeout);
 
@@ -300,15 +457,12 @@ function handleMouseLeave(event) {
   hideTimeout = setTimeout(() => {
     const elementUnderMouse = document.elementFromPoint(lastMouseX, lastMouseY);
     if (elementUnderMouse) {
-      // Find the best poster-level ancestor under the mouse
       const posterElement = findPosterAncestor(elementUnderMouse);
 
       if (posterElement) {
         log('Mouse still over Netflix content, keeping overlay');
         currentHoveredElement = posterElement;
         positionOverlay(currentHoveredElement);
-
-        // Ensure listeners are attached to the new element
         ensureListenerAttached(posterElement);
         return;
       }
@@ -354,9 +508,12 @@ async function fetchAndDisplayRating(element) {
 
   const normalizedTitle = normalizeTitle(titleInfo.title);
 
-  // If we're already showing this title, don't refetch
-  if (currentTitle === normalizedTitle && floatingOverlay?.style.opacity === '1') {
-    log('Already showing rating for:', normalizedTitle);
+  // Build a unique key that includes year and type for cache dedup
+  const cacheDedup = `${normalizedTitle}|${titleInfo.year || ''}|${titleInfo.mediaType || ''}`;
+
+  // If we're already showing this exact title+year+type, don't refetch
+  if (currentTitle === cacheDedup && floatingOverlay?.style.opacity === '1') {
+    log('Already showing rating for:', cacheDedup);
     if (currentHoveredElement) {
       positionOverlay(currentHoveredElement);
     }
@@ -364,38 +521,35 @@ async function fetchAndDisplayRating(element) {
   }
 
   log('Title info:', titleInfo);
-  currentTitle = normalizedTitle;
+  currentTitle = cacheDedup;
 
-  // Issue #11: Don't show loading spinner — let the service worker check cache first.
-  // The cache check is fast (~1-5ms). Only show spinner if it takes longer than 150ms.
-  let loadingShown = false;
+  // Only show spinner after 150ms (cached results return faster)
   const loadingTimer = setTimeout(() => {
-    if (currentHoveredElement === element && currentTitle === normalizedTitle) {
+    if (currentHoveredElement === element && currentTitle === cacheDedup) {
       showFloatingOverlay(element, { loading: true });
-      loadingShown = true;
     }
   }, 150);
 
   try {
-    log('Sending request for:', normalizedTitle);
+    log('Sending request for:', normalizedTitle, 'year:', titleInfo.year, 'type:', titleInfo.mediaType);
 
     const rating = await chrome.runtime.sendMessage({
       type: 'FETCH_RATING',
       title: normalizedTitle,
-      year: titleInfo.year,
-      mediaType: titleInfo.mediaType
+      year: titleInfo.year || null,
+      mediaType: titleInfo.mediaType || null,
     });
 
     clearTimeout(loadingTimer);
     log('Received rating:', rating);
 
-    if (currentHoveredElement && currentTitle === normalizedTitle) {
+    if (currentHoveredElement && currentTitle === cacheDedup) {
       showFloatingOverlay(currentHoveredElement, rating);
     }
   } catch (error) {
     clearTimeout(loadingTimer);
     console.error('Netflix Ratings: Failed to fetch rating:', error);
-    if (currentHoveredElement && currentTitle === normalizedTitle) {
+    if (currentHoveredElement && currentTitle === cacheDedup) {
       showFloatingOverlay(currentHoveredElement, { error: 'Failed to fetch rating' });
     }
   }
@@ -403,9 +557,6 @@ async function fetchAndDisplayRating(element) {
 
 // ─── Poster detection & listener attachment ───────────────────
 
-// Issue #2: Use a single canonical selector to find the best poster-level
-// element. Instead of attaching to every nested element, find the outermost
-// poster container. This avoids multiple overlapping listeners.
 const POSTER_SELECTORS = [
   '.slider-item',
   '.title-card-container',
@@ -415,15 +566,12 @@ const POSTER_SELECTORS = [
   '[class*="jawBone"]',
 ];
 
-// Selector string for querySelectorAll
 const POSTER_SELECTOR_STRING = POSTER_SELECTORS.join(', ');
 
-// Given any element, find its outermost poster ancestor
 function findPosterAncestor(el) {
   let best = null;
   let current = el;
 
-  // Walk up to find the outermost poster container
   while (current && current !== document.body) {
     if (matchesPosterSelector(current)) {
       best = current;
@@ -431,7 +579,6 @@ function findPosterAncestor(el) {
     current = current.parentElement;
   }
 
-  // If no ancestor found, check if the element itself matches
   if (!best && matchesPosterSelector(el)) {
     best = el;
   }
@@ -458,21 +605,15 @@ function ensureListenerAttached(element) {
   }
 }
 
-// Issue #2: Attach listeners only to the outermost poster container,
-// not to every nested child that matches a selector.
 function attachHoverListeners(container) {
   const posters = container.querySelectorAll(POSTER_SELECTOR_STRING);
 
   posters.forEach(poster => {
-    // Skip if already attached
     if (poster.dataset.nroAttached) return;
 
-    // Issue #2: Skip if a parent poster already has listeners
-    // (only attach to outermost poster element)
     const parentPoster = poster.parentElement?.closest(POSTER_SELECTOR_STRING);
     if (parentPoster && parentPoster.dataset.nroAttached) return;
 
-    // Skip account/profile links
     const href = poster.getAttribute('href') || '';
     if (href.includes('Account') || href.includes('profile')) return;
 
@@ -484,16 +625,13 @@ function attachHoverListeners(container) {
 
 // ─── MutationObserver ─────────────────────────────────────────
 
-// Issue #3 & #4: Single observer, debounced body scans, no duplicate setup
 function initObserver() {
-  // Disconnect any existing observer
   if (mutationObserver) {
     mutationObserver.disconnect();
     mutationObserver = null;
   }
 
   mutationObserver = new MutationObserver((mutations) => {
-    // Attach to newly added nodes directly
     for (const mutation of mutations) {
       for (const node of mutation.addedNodes) {
         if (node.nodeType === Node.ELEMENT_NODE) {
@@ -502,7 +640,6 @@ function initObserver() {
       }
     }
 
-    // Issue #4: Debounce the full-body scan — at most once per second
     if (!pendingBodyScan) {
       pendingBodyScan = setTimeout(() => {
         pendingBodyScan = null;
@@ -525,16 +662,12 @@ function handleDocumentMouseOver(event) {
   if (!extensionEnabled) return;
 
   const target = event.target;
-
-  // Find the poster element under the mouse
   const posterElement = findPosterAncestor(target);
 
   if (posterElement && !posterElement.dataset.nroAttached) {
     clearTimeout(hideTimeout);
-
     ensureListenerAttached(posterElement);
 
-    // If we have a current overlay showing, update to track new element
     if (floatingOverlay && floatingOverlay.style.opacity === '1') {
       currentHoveredElement = posterElement;
       positionOverlay(posterElement);
@@ -544,7 +677,6 @@ function handleDocumentMouseOver(event) {
 
 // ─── Listen for enable/disable changes from popup ─────────────
 
-// Issue #9: React to storage changes (enable/disable toggle)
 function onStorageChanged(changes, area) {
   if (area !== 'local') return;
 
@@ -553,7 +685,6 @@ function onStorageChanged(changes, area) {
     log('Extension enabled changed to:', extensionEnabled);
 
     if (!extensionEnabled) {
-      // Immediately hide overlay and clear state
       clearTimeout(hoverTimeout);
       clearTimeout(hideTimeout);
       currentHoveredElement = null;
@@ -565,7 +696,6 @@ function onStorageChanged(changes, area) {
 
 // ─── Cleanup ──────────────────────────────────────────────────
 
-// Issue #3: Proper cleanup so re-init doesn't stack listeners/observers
 function cleanup() {
   if (mutationObserver) {
     mutationObserver.disconnect();
@@ -587,18 +717,13 @@ function cleanup() {
 
   document.removeEventListener('mousemove', handleMouseMove);
   document.removeEventListener('mouseover', handleDocumentMouseOver);
-
-  // Note: We do NOT remove per-element mouseenter/mouseleave listeners
-  // because they are guarded by dataset.nroAttached and are harmless to keep.
 }
 
 // ─── Initialization ───────────────────────────────────────────
 
-// Issue #3: Guard against duplicate initialization
 async function init() {
   log('Starting initialization...');
 
-  // Clean up any previous state
   cleanup();
 
   let settings;
@@ -614,7 +739,6 @@ async function init() {
 
   if (!extensionEnabled) {
     log('Extension is disabled');
-    // Still set up storage listener so we can re-enable
     if (!initialized) {
       chrome.storage.onChanged.addListener(onStorageChanged);
     }
@@ -626,29 +750,21 @@ async function init() {
     log('WARNING: No API key configured!');
   }
 
-  // Create floating overlay
   createFloatingOverlay();
 
-  // Track mouse movement
   document.addEventListener('mousemove', handleMouseMove, { passive: true });
-
-  // Global mouseover to catch dynamically created preview elements
   document.addEventListener('mouseover', handleDocumentMouseOver, { passive: true });
 
-  // Issue #9: Listen for storage changes (enable/disable from popup)
   if (!initialized) {
     chrome.storage.onChanged.addListener(onStorageChanged);
   }
 
-  // Initial scan
   attachHoverListeners(document.body);
   log('Initial scan complete');
 
-  // Watch for dynamically loaded content
   initObserver();
   log('Observer started');
 
-  // Re-scan after delays for lazy-loaded content
   attachScanTimeout = setTimeout(() => attachHoverListeners(document.body), 2000);
   attachScanTimeout2 = setTimeout(() => attachHoverListeners(document.body), 5000);
 
@@ -656,15 +772,12 @@ async function init() {
   log('Initialization complete!');
 }
 
-// Start when DOM is ready
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', init);
 } else {
   init();
 }
 
-// Issue #3: Reinitialize on URL changes without stacking observers.
-// Use a single URL observer, and call init() which cleans up first.
 let lastUrl = location.href;
 urlObserver = new MutationObserver(() => {
   const url = location.href;
