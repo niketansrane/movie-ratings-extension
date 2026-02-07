@@ -248,6 +248,12 @@ input::placeholder {
   opacity: 1;
 }
 
+.status.info {
+  background: rgba(255, 193, 7, 0.15);
+  color: #ffc107;
+  opacity: 1;
+}
+
 /* Footer */
 .footer {
   margin-top: 16px;

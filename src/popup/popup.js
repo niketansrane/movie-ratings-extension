@@ -29,15 +29,18 @@ async function saveSettings() {
   }
 
   // Validate API key by making a test request
-  showStatus('Validating API key...', 'success');
+  showStatus('Validating API key...', 'info');
 
   try {
     const response = await fetch(`https://www.omdbapi.com/?apikey=${apiKey}&t=inception`);
     const data = await response.json();
 
-    if (data.Error && data.Error.includes('Invalid API key')) {
-      showStatus('Invalid API key', 'error');
-      return;
+    // Issue #10: Better detection of invalid API keys
+    if (data.Response === 'False' && data.Error) {
+      if (data.Error.toLowerCase().includes('invalid api key')) {
+        showStatus('Invalid API key. Please check and try again.', 'error');
+        return;
+      }
     }
 
     await chrome.storage.local.set({ apiKey, enabled });
@@ -45,13 +48,21 @@ async function saveSettings() {
   } catch (error) {
     // Save anyway if network error (key might still be valid)
     await chrome.storage.local.set({ apiKey, enabled });
-    showStatus('Saved (could not validate)', 'success');
+    showStatus('Saved (could not validate — network error)', 'success');
   }
 }
 
+// Issue #9: Toggle writes to storage; content script listens via
+// chrome.storage.onChanged to react immediately.
 async function toggleEnabled(event) {
   const enabled = event.target.checked;
   await chrome.storage.local.set({ enabled });
+
+  if (enabled) {
+    showStatus('Extension enabled', 'success');
+  } else {
+    showStatus('Extension disabled', 'info');
+  }
 }
 
 async function clearCache() {
@@ -59,7 +70,7 @@ async function clearCache() {
   const ratingKeys = Object.keys(all).filter(k => k.startsWith('rating_'));
 
   if (ratingKeys.length === 0) {
-    showStatus('Cache is already empty', 'success');
+    showStatus('Cache is already empty', 'info');
     return;
   }
 
@@ -77,7 +88,15 @@ async function updateStats() {
   // API calls tracking
   const today = new Date().toDateString();
   if (all.apiCallsDate === today) {
-    document.getElementById('apiCalls').textContent = all.apiCallsToday || 0;
+    const calls = all.apiCallsToday || 0;
+    document.getElementById('apiCalls').textContent = calls;
+
+    // Warn if approaching limit
+    if (calls >= 900) {
+      document.getElementById('apiCalls').style.color = '#dc3545';
+    } else {
+      document.getElementById('apiCalls').style.color = '';
+    }
   } else {
     document.getElementById('apiCalls').textContent = '0';
   }
