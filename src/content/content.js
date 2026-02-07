@@ -59,8 +59,7 @@ function createFloatingOverlay() {
 // ─── Title & metadata extraction ──────────────────────────────
 
 // Extract comprehensive metadata from the Netflix DOM element to
-// improve OMDb matching accuracy. We gather: title, year, mediaType,
-// and Netflix video ID when available.
+// improve OMDb matching accuracy. We gather: title, year, mediaType.
 function extractTitleFromElement(element) {
   let title = null;
   let year = null;
@@ -91,8 +90,20 @@ function extractTitleFromElement(element) {
   }
 
   // ── Strategy 3: Netflix-specific title selectors ──
+  // Covers both small poster cards AND the large hero/billboard banner
   if (!title) {
     const titleSelectors = [
+      // Hero banner / billboard selectors
+      '.billboard-title .title-logo',
+      '.hero-title .title-logo',
+      '[class*="billboard"] .title-logo',
+      '[class*="hero"] .title-logo',
+      '[class*="billboard"] [class*="title-treatment"]',
+      '[class*="billboard"] [class*="titleTreatment"]',
+      '[class*="billboard-title"]',
+      '[class*="hero-title"]',
+      '.title-treatment',
+      // Small poster card selectors
       '.fallback-text',
       '.title-card-title',
       '.previewModal-player-titleTreatment-logo',
@@ -118,13 +129,25 @@ function extractTitleFromElement(element) {
     }
   }
 
-  // ── Strategy 4: Look in preview modal ancestors ──
+  // ── Strategy 4: Look in preview modal / billboard ancestors ──
   if (!title) {
     const roots = getSearchRoots(element);
     rootSearch:
     for (const root of roots) {
       if (root === element) continue; // Already searched element in strategies 1-3
-      for (const selector of ['.previewModal-player-titleTreatment-logo', '.previewModal-title', '.bob-title']) {
+      const ancestorTitleSelectors = [
+        '.billboard-title .title-logo',
+        '[class*="billboard"] .title-logo',
+        '[class*="billboard"] [class*="title-treatment"]',
+        '[class*="billboard"] [class*="titleTreatment"]',
+        '[class*="billboard-title"]',
+        '[class*="hero-title"]',
+        '.title-treatment',
+        '.previewModal-player-titleTreatment-logo',
+        '.previewModal-title',
+        '.bob-title',
+      ];
+      for (const selector of ancestorTitleSelectors) {
         const titleEl = root.querySelector(selector);
         if (titleEl) {
           if (titleEl.tagName === 'IMG' && titleEl.alt) {
@@ -163,11 +186,15 @@ function extractTitleFromElement(element) {
   };
 }
 
-// Helper: get the element and its preview modal ancestor as search roots
+// Helper: get the element and its relevant ancestors as search roots
 function getSearchRoots(element) {
   const roots = [element];
-  const previewModal = element.closest('[class*="previewModal"], [class*="jawBone"], .bob-card, .mini-modal');
-  if (previewModal) roots.push(previewModal);
+  // Look for preview modal or billboard ancestor
+  const ancestor = element.closest(
+    '[class*="previewModal"], [class*="jawBone"], .bob-card, .mini-modal, ' +
+    '[class*="billboard"], [class*="hero-image"], [class*="hero_billboard"]'
+  );
+  if (ancestor) roots.push(ancestor);
   return roots;
 }
 
@@ -190,6 +217,9 @@ function extractYearFromDOM(element) {
       '[class*="videoMetadata"]',
       '.previewModal--detailsMetadata-left',
       '[class*="detailsMetadata"]',
+      // Hero banner metadata
+      '[class*="billboard"] [class*="supplemental"]',
+      '[class*="billboard"] [class*="info"]',
     ];
 
     for (const sel of metaSelectors) {
@@ -197,13 +227,10 @@ function extractYearFromDOM(element) {
       for (const el of els) {
         const text = el.textContent?.trim();
         if (text) {
-          // Match a standalone 4-digit year (1950-2039)
-          // Avoid matching numbers in "12345 views", "TV-14", "2000+", etc.
           const yearMatch = text.match(/(?:^|\s)((?:19[5-9]\d|20[0-3]\d))(?:\s|$|,|\))/);
           if (yearMatch) {
             const candidateYear = parseInt(yearMatch[1]);
             const currentYear = new Date().getFullYear();
-            // Sanity check: year should be between 1950 and next year
             if (candidateYear >= 1950 && candidateYear <= currentYear + 1) {
               log('Found year from DOM metadata:', yearMatch[1], 'in selector:', sel);
               return yearMatch[1];
@@ -227,6 +254,9 @@ function detectMediaTypeFromDOM(element) {
     '.supplemental-message', '[class*="supplemental"]',
     '.episodeSelector', '[class*="episode"]',
     '.previewModal--detailsMetadata-left', '[class*="detailsMetadata"]',
+    // Hero banner metadata
+    '[class*="billboard"] [class*="supplemental"]',
+    '[class*="billboard"] [class*="info"]',
   ];
 
   for (const root of searchRoots) {
@@ -301,6 +331,10 @@ function normalizeTitle(title) {
 function showFloatingOverlay(element, data) {
   const overlay = createFloatingOverlay();
 
+  // Toggle hero-mode class for larger badges on hero banners
+  const heroMode = isHeroBanner(element);
+  overlay.classList.toggle('nro-hero-mode', heroMode);
+
   if (data.loading) {
     overlay.innerHTML = '<div class="nro-ratings-loading"><span class="nro-spinner"></span></div>';
   } else if (data.error) {
@@ -323,6 +357,8 @@ function showFloatingOverlay(element, data) {
   startPositionTracking(element);
 }
 
+// ─── Overlay positioning — always top-left of the element ─────
+
 function positionOverlay(element) {
   if (!floatingOverlay) return;
 
@@ -331,28 +367,48 @@ function positionOverlay(element) {
 
   const rect = element.getBoundingClientRect();
 
-  if (rect.width < 10 || rect.height < 10) {
-    return;
-  }
+  // Skip if element is too small or not visible
+  if (rect.width < 10 || rect.height < 10) return;
 
-  let left = rect.left + 8;
-  let top = rect.top + 8;
+  // Determine if this is a hero/billboard banner (large element, typically full width)
+  const isHero = isHeroBanner(element);
+  const padding = isHero ? 20 : 8;
 
+  // Always anchor to top-left corner of the element
+  let left = rect.left + padding;
+  let top = rect.top + padding;
+
+  // Ensure the overlay stays within the viewport
   const overlayRect = floatingOverlay.getBoundingClientRect();
   const overlayWidth = overlayRect.width || 150;
   const overlayHeight = overlayRect.height || 30;
 
-  if (left + overlayWidth > window.innerWidth) {
-    left = rect.right - overlayWidth - 8;
+  // If top-left would push overlay off-screen right, clamp to right edge
+  if (left + overlayWidth > window.innerWidth - 10) {
+    left = window.innerWidth - overlayWidth - 10;
   }
-  if (top + overlayHeight > window.innerHeight) {
+  // If the element's top is above viewport (scrolled), clamp to top of viewport
+  if (top < 10) top = 10;
+  // If pushed below viewport, clamp
+  if (top + overlayHeight > window.innerHeight - 10) {
     top = window.innerHeight - overlayHeight - 10;
   }
-  if (left < 0) left = 10;
-  if (top < 0) top = 10;
+  if (left < 10) left = 10;
 
   floatingOverlay.style.left = `${left}px`;
   floatingOverlay.style.top = `${top}px`;
+}
+
+function isHeroBanner(element) {
+  // Check if this element or an ancestor is a hero/billboard banner
+  try {
+    return !!(
+      element.matches('[class*="billboard"], [class*="hero-image"], [class*="hero_billboard"]') ||
+      element.closest('[class*="billboard"], [class*="hero-image"], [class*="hero_billboard"]')
+    );
+  } catch (e) {
+    return false;
+  }
 }
 
 function startPositionTracking(element) {
@@ -534,8 +590,9 @@ async function fetchAndDisplayRating(element) {
   }
 }
 
-// ─── Poster detection & listener attachment ───────────────────
+// ─── Poster & banner detection ────────────────────────────────
 
+// Selectors for small poster cards (bottom half — rows of movies/series)
 const POSTER_SELECTORS = [
   '.slider-item',
   '.title-card-container',
@@ -545,14 +602,27 @@ const POSTER_SELECTORS = [
   '[class*="jawBone"]',
 ];
 
-const POSTER_SELECTOR_STRING = POSTER_SELECTORS.join(', ');
+// Selectors for the hero/billboard banner (top half — featured movie)
+const HERO_SELECTORS = [
+  '.billboard-row',
+  '[class*="billboard-row"]',
+  '[class*="billboardRow"]',
+  '[class*="hero-image"]',
+  '[class*="hero_billboard"]',
+  '[class*="heroImage"]',
+  '.billboard',
+  '[class*="billboard"]:not([class*="billboard-motion"])',
+];
+
+const ALL_SELECTORS = [...POSTER_SELECTORS, ...HERO_SELECTORS];
+const ALL_SELECTOR_STRING = ALL_SELECTORS.join(', ');
 
 function findPosterAncestor(el) {
   let best = null;
   let current = el;
 
   while (current && current !== document.body) {
-    if (matchesPosterSelector(current)) {
+    if (matchesAnySelector(current)) {
       best = current;
     }
     current = current.parentElement;
@@ -561,9 +631,9 @@ function findPosterAncestor(el) {
   return best;
 }
 
-function matchesPosterSelector(el) {
+function matchesAnySelector(el) {
   try {
-    return el.matches && el.matches(POSTER_SELECTOR_STRING);
+    return el.matches && el.matches(ALL_SELECTOR_STRING);
   } catch (e) {
     return false;
   }
@@ -581,28 +651,34 @@ function ensureListenerAttached(element) {
 }
 
 function attachHoverListeners(container) {
-  const posters = container.querySelectorAll(POSTER_SELECTOR_STRING);
+  const elements = container.querySelectorAll(ALL_SELECTOR_STRING);
 
-  posters.forEach(poster => {
-    if (poster.dataset.nroAttached) return;
+  elements.forEach(el => {
+    if (el.dataset.nroAttached) return;
 
-    // Skip if any ancestor poster is already attached (outermost-only strategy)
-    const parentPoster = poster.parentElement?.closest(POSTER_SELECTOR_STRING);
-    if (parentPoster && parentPoster.dataset.nroAttached) return;
+    // Skip if any ancestor is already attached (outermost-only strategy)
+    const parentEl = el.parentElement?.closest(ALL_SELECTOR_STRING);
+    if (parentEl && parentEl.dataset.nroAttached) return;
 
-    // If parent poster exists within this container but isn't attached yet,
+    // If parent exists within this container but isn't attached yet,
     // skip this child — the parent will be processed in its own iteration.
-    // But if the parent is outside the container, we must attach this child
-    // since the parent won't be processed by this call.
-    if (parentPoster && container.contains(parentPoster)) return;
+    if (parentEl && container.contains(parentEl)) return;
 
-    const href = poster.getAttribute('href') || '';
+    const href = el.getAttribute('href') || '';
     if (href.includes('Account') || href.includes('profile')) return;
 
-    poster.dataset.nroAttached = 'true';
-    poster.addEventListener('mouseenter', handleMouseEnter);
-    poster.addEventListener('mouseleave', handleMouseLeave);
+    el.dataset.nroAttached = 'true';
+    el.addEventListener('mouseenter', handleMouseEnter);
+    el.addEventListener('mouseleave', handleMouseLeave);
   });
+
+  // Also attach directly to the container if it matches (e.g., MutationObserver
+  // adds a billboard node itself, not just children)
+  if (!container.dataset?.nroAttached && matchesAnySelector(container)) {
+    container.dataset.nroAttached = 'true';
+    container.addEventListener('mouseenter', handleMouseEnter);
+    container.addEventListener('mouseleave', handleMouseLeave);
+  }
 }
 
 // ─── MutationObserver ─────────────────────────────────────────
@@ -638,25 +714,25 @@ function initObserver() {
   return mutationObserver;
 }
 
-// ─── Document-level mouseover for dynamic previews ────────────
+// ─── Document-level mouseover for dynamic content ─────────────
 
 function handleDocumentMouseOver(event) {
   if (!extensionEnabled) return;
 
   const target = event.target;
 
-  // Early bail: skip non-element targets and targets that are clearly not posters
+  // Early bail: skip non-element targets
   if (!target || !target.closest) return;
 
-  const posterElement = findPosterAncestor(target);
+  const matchedElement = findPosterAncestor(target);
 
-  if (posterElement && !posterElement.dataset.nroAttached) {
+  if (matchedElement && !matchedElement.dataset.nroAttached) {
     clearTimeout(hideTimeout);
-    ensureListenerAttached(posterElement);
+    ensureListenerAttached(matchedElement);
 
     if (floatingOverlay && floatingOverlay.style.opacity === '1') {
-      currentHoveredElement = posterElement;
-      positionOverlay(posterElement);
+      currentHoveredElement = matchedElement;
+      positionOverlay(matchedElement);
     }
   }
 }

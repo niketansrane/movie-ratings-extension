@@ -10,6 +10,8 @@
   gap: 4px !important;
 }
 
+/* ─── Rating badges (default: small poster cards) ────────────── */
+
 .nro-rating-badge {
   display: flex !important;
   align-items: center !important;
@@ -52,6 +54,30 @@
   font-weight: 700 !important;
   font-size: 14px !important;
 }
+
+/* ─── Hero / billboard mode — larger badges ──────────────────── */
+
+#nro-floating-overlay.nro-hero-mode {
+  gap: 8px !important;
+}
+
+#nro-floating-overlay.nro-hero-mode .nro-rating-badge {
+  padding: 8px 16px !important;
+  border-radius: 6px !important;
+  font-size: 15px !important;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.7) !important;
+}
+
+#nro-floating-overlay.nro-hero-mode .nro-rating-icon {
+  font-size: 12px !important;
+  letter-spacing: 0.8px !important;
+}
+
+#nro-floating-overlay.nro-hero-mode .nro-rating-value {
+  font-size: 18px !important;
+}
+
+/* ─── Loading spinner ────────────────────────────────────────── */
 
 .nro-ratings-loading {
   padding: 6px 12px !important;
