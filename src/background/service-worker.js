@@ -6,8 +6,7 @@ const MAX_CACHE_SIZE = 1000;
 const PRUNE_CHECK_INTERVAL = 50;
 const API_DAILY_LIMIT = 1000;
 const API_WARN_THRESHOLD = 900;
-
-let cacheWriteCount = 0;
+const FETCH_TIMEOUT_MS = 8000; // 8 second timeout for API calls
 
 // Listen for messages from content script
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
@@ -21,8 +20,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
 async function fetchRating(title, year, mediaType) {
   // Cache key includes year and type so different versions of the same title
-  // are cached separately
-  const cacheKey = `rating_${title.toLowerCase()}_${year || ''}_${mediaType || 'any'}`;
+  // are cached separately. Truncate long titles to keep keys reasonable.
+  const keyTitle = title.toLowerCase().substring(0, 100);
+  const cacheKey = `rating_${keyTitle}_${year || ''}_${mediaType || 'any'}`;
 
   // Check cache first
   const cached = await getCachedRating(cacheKey);
@@ -67,11 +67,31 @@ async function fetchRating(title, year, mediaType) {
 
   } catch (error) {
     console.error('OMDb API error:', error);
-    return { error: 'Failed to fetch rating. Please try again.' };
+    // Preserve specific error messages (e.g. invalid API key) instead of generic fallback
+    const message = error.message || 'Failed to fetch rating. Please try again.';
+    return { error: message };
   }
 }
 
 // ─── Search strategies ────────────────────────────────────────
+
+// Fetch with timeout to prevent hanging on slow/unresponsive API
+async function fetchWithTimeout(url, timeoutMs = FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    clearTimeout(timer);
+    return response;
+  } catch (error) {
+    clearTimeout(timer);
+    if (error.name === 'AbortError') {
+      throw new Error('Request timed out. OMDb API may be slow — please try again.');
+    }
+    throw error;
+  }
+}
 
 // Exact search with title, year, and type — most precise
 async function exactSearch(apiKey, title, year, mediaType) {
@@ -82,7 +102,7 @@ async function exactSearch(apiKey, title, year, mediaType) {
   if (year) params.append('y', year);
   if (mediaType) params.append('type', mediaType);
 
-  const response = await fetch(`https://www.omdbapi.com/?${params}`);
+  const response = await fetchWithTimeout(`https://www.omdbapi.com/?${params}`);
   const data = await response.json();
   await incrementApiCalls();
 
@@ -119,29 +139,30 @@ async function smartSearch(apiKey, title, year, mediaType) {
   // Step 1: Try exact search first (it's the most reliable when it works)
   const exactType = mediaType || 'movie';
   const exactResult = await exactSearch(apiKey, title, year, exactType);
-  if (exactResult) {
-    // Verify the result looks reasonable
-    if (isTitleMatch(title, exactResult.Title)) {
-      return exactResult;
-    }
+  const exactIsGoodMatch = exactResult && isTitleMatch(title, exactResult.Title);
+
+  if (exactIsGoodMatch) {
+    // Don't return yet — still try the alt type to see if there's a better match
   }
 
   // Check rate limit before continuing
-  if (await isRateLimited()) return exactResult || null;
+  if (await isRateLimited()) return exactIsGoodMatch ? exactResult : null;
 
   // Step 2: If exact search failed or returned a poor match, try the other type
   const altType = (mediaType === 'series') ? 'movie' : 'series';
   const altResult = await exactSearch(apiKey, title, year, altType);
   if (altResult && isTitleMatch(title, altResult.Title)) {
-    // If we had both results, prefer the one with a closer title match
-    if (exactResult) {
+    if (exactIsGoodMatch) {
       return pickBestMatch(title, year, [exactResult, altResult]);
     }
     return altResult;
   }
 
+  // If exact was a good match and alt wasn't better, return exact
+  if (exactIsGoodMatch) return exactResult;
+
   // Check rate limit before search API
-  if (await isRateLimited()) return exactResult || null;
+  if (await isRateLimited()) return null;
 
   // Step 3: Use the search API for broader matching
   const searchParams = new URLSearchParams({
@@ -150,7 +171,7 @@ async function smartSearch(apiKey, title, year, mediaType) {
   });
   if (mediaType) searchParams.append('type', mediaType);
 
-  const searchResponse = await fetch(`https://www.omdbapi.com/?${searchParams}`);
+  const searchResponse = await fetchWithTimeout(`https://www.omdbapi.com/?${searchParams}`);
   const searchData = await searchResponse.json();
   await incrementApiCalls();
 
@@ -159,17 +180,17 @@ async function smartSearch(apiKey, title, year, mediaType) {
   }
 
   if (searchData.Response !== 'True' || !searchData.Search?.length) {
-    return exactResult || null;
+    return null;
   }
 
   // Score candidates and pick the best one
   const candidates = searchData.Search;
   const bestCandidate = pickBestMatch(title, year, candidates);
 
-  if (!bestCandidate) return exactResult || null;
+  if (!bestCandidate) return null;
 
   // Check rate limit before fetching full details
-  if (await isRateLimited()) return exactResult || null;
+  if (await isRateLimited()) return null;
 
   // Fetch full details for the best candidate (search results don't include ratings)
   const detailParams = new URLSearchParams({
@@ -177,7 +198,7 @@ async function smartSearch(apiKey, title, year, mediaType) {
     i: bestCandidate.imdbID,
   });
 
-  const detailResponse = await fetch(`https://www.omdbapi.com/?${detailParams}`);
+  const detailResponse = await fetchWithTimeout(`https://www.omdbapi.com/?${detailParams}`);
   const detailData = await detailResponse.json();
   await incrementApiCalls();
 
@@ -185,7 +206,7 @@ async function smartSearch(apiKey, title, year, mediaType) {
     return detailData;
   }
 
-  return exactResult || null;
+  return null;
 }
 
 // ─── Matching & scoring ──────────────────────────────────────
@@ -307,15 +328,25 @@ function isInvalidKeyError(data) {
 // ─── Data processing ─────────────────────────────────────────
 
 async function processAndCacheRating(cacheKey, data) {
+  const imdbRating = (data.imdbRating && data.imdbRating !== 'N/A') ? data.imdbRating : null;
+  const rottenTomatoes = extractRottenTomatoes(data.Ratings);
+
   const rating = {
-    imdbRating: data.imdbRating,
-    rottenTomatoes: extractRottenTomatoes(data.Ratings),
+    imdbRating,
+    rottenTomatoes,
     title: data.Title,
     year: data.Year,
     type: data.Type,
     imdbID: data.imdbID,
     cachedAt: Date.now()
   };
+
+  // If neither rating is available, treat as not found
+  if (!imdbRating && !rottenTomatoes) {
+    const notFoundResult = { notFound: true, title: data.Title, cachedAt: Date.now() };
+    await cacheRating(cacheKey, notFoundResult);
+    return notFoundResult;
+  }
 
   await cacheRating(cacheKey, rating);
   return rating;
@@ -349,12 +380,17 @@ async function getCachedRating(key) {
 }
 
 async function cacheRating(key, data) {
-  await chrome.storage.local.set({ [key]: data });
+  // Prune periodically — use storage counter since service worker memory is ephemeral
+  const result = await chrome.storage.local.get('_nro_cacheWriteCount');
+  const count = (result._nro_cacheWriteCount || 0) + 1;
 
-  cacheWriteCount++;
-  if (cacheWriteCount >= PRUNE_CHECK_INTERVAL) {
-    cacheWriteCount = 0;
+  if (count >= PRUNE_CHECK_INTERVAL) {
+    // Batch data + counter reset in one write
+    await chrome.storage.local.set({ [key]: data, _nro_cacheWriteCount: 0 });
     await pruneCache();
+  } else {
+    // Batch data + counter increment in one write
+    await chrome.storage.local.set({ [key]: data, _nro_cacheWriteCount: count });
   }
 }
 
@@ -362,12 +398,31 @@ async function pruneCache() {
   const all = await chrome.storage.local.get(null);
   const ratingKeys = Object.keys(all).filter(k => k.startsWith('rating_'));
 
-  if (ratingKeys.length > MAX_CACHE_SIZE) {
-    const entries = ratingKeys.map(k => ({ key: k, cachedAt: all[k]?.cachedAt || 0 }));
-    entries.sort((a, b) => a.cachedAt - b.cachedAt);
+  const now = Date.now();
+  const expiredKeys = [];
+  const validEntries = [];
 
-    const toRemove = entries.slice(0, ratingKeys.length - MAX_CACHE_SIZE);
-    await chrome.storage.local.remove(toRemove.map(e => e.key));
+  for (const key of ratingKeys) {
+    const entry = all[key];
+    if (!entry?.cachedAt || now - entry.cachedAt > CACHE_TTL) {
+      expiredKeys.push(key);
+    } else {
+      validEntries.push({ key, cachedAt: entry.cachedAt });
+    }
+  }
+
+  // Remove all expired entries
+  const toRemove = [...expiredKeys];
+
+  // Also trim to MAX_CACHE_SIZE by removing oldest valid entries
+  if (validEntries.length > MAX_CACHE_SIZE) {
+    validEntries.sort((a, b) => a.cachedAt - b.cachedAt);
+    const excess = validEntries.slice(0, validEntries.length - MAX_CACHE_SIZE);
+    toRemove.push(...excess.map(e => e.key));
+  }
+
+  if (toRemove.length > 0) {
+    await chrome.storage.local.remove(toRemove);
   }
 }
 
@@ -381,20 +436,36 @@ async function getApiCallCount() {
   return 0;
 }
 
-async function incrementApiCalls() {
-  const today = new Date().toDateString();
-  const result = await chrome.storage.local.get(['apiCallsToday', 'apiCallsDate']);
+// Simple async lock to prevent TOCTOU races on API call counter
+let _apiCountLock = null;
 
-  let count;
-  if (result.apiCallsDate === today) {
-    count = (result.apiCallsToday || 0) + 1;
-  } else {
-    count = 1;
+async function incrementApiCalls() {
+  // Wait for any in-flight increment to finish
+  while (_apiCountLock) {
+    await _apiCountLock;
   }
 
-  await chrome.storage.local.set({ apiCallsToday: count, apiCallsDate: today });
+  let resolve;
+  _apiCountLock = new Promise(r => { resolve = r; });
 
-  if (count === API_WARN_THRESHOLD) {
-    console.warn(`[Netflix Ratings] Approaching daily API limit: ${count}/${API_DAILY_LIMIT} calls used.`);
+  try {
+    const today = new Date().toDateString();
+    const result = await chrome.storage.local.get(['apiCallsToday', 'apiCallsDate']);
+
+    let count;
+    if (result.apiCallsDate === today) {
+      count = (result.apiCallsToday || 0) + 1;
+    } else {
+      count = 1;
+    }
+
+    await chrome.storage.local.set({ apiCallsToday: count, apiCallsDate: today });
+
+    if (count === API_WARN_THRESHOLD) {
+      console.warn(`[Netflix Ratings] Approaching daily API limit: ${count}/${API_DAILY_LIMIT} calls used.`);
+    }
+  } finally {
+    _apiCountLock = null;
+    resolve();
   }
 }

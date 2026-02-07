@@ -22,17 +22,27 @@ document.addEventListener('DOMContentLoaded', async () => {
 async function saveSettings() {
   const apiKey = document.getElementById('apiKey').value.trim();
   const enabled = document.getElementById('enabled').checked;
+  const saveBtn = document.getElementById('save');
 
   if (!apiKey) {
     showStatus('Please enter an API key', 'error');
     return;
   }
 
+  // Disable button during validation to prevent double-clicks
+  saveBtn.disabled = true;
+  saveBtn.textContent = 'Saving...';
+
   // Validate API key by making a test request
   showStatus('Validating API key...', 'info');
 
   try {
-    const response = await fetch(`https://www.omdbapi.com/?apikey=${apiKey}&t=inception`);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    const response = await fetch(`https://www.omdbapi.com/?apikey=${apiKey}&t=inception`, {
+      signal: controller.signal
+    });
+    clearTimeout(timer);
     const data = await response.json();
 
     // Issue #10: Better detection of invalid API keys
@@ -49,6 +59,9 @@ async function saveSettings() {
     // Save anyway if network error (key might still be valid)
     await chrome.storage.local.set({ apiKey, enabled });
     showStatus('Saved (could not validate — network error)', 'success');
+  } finally {
+    saveBtn.disabled = false;
+    saveBtn.textContent = 'Save';
   }
 }
 
@@ -75,6 +88,8 @@ async function clearCache() {
   }
 
   await chrome.storage.local.remove(ratingKeys);
+  // Also reset the cache write counter
+  await chrome.storage.local.set({ _nro_cacheWriteCount: 0 });
   await updateStats();
   showStatus(`Cleared ${ratingKeys.length} cached ratings`, 'success');
 }
@@ -121,13 +136,19 @@ function togglePasswordVisibility() {
   }
 }
 
+let statusTimer = null;
+
 function showStatus(message, type) {
   const status = document.getElementById('status');
   status.textContent = message;
   status.className = `status ${type}`;
 
+  // Clear any previous auto-hide timer
+  if (statusTimer) clearTimeout(statusTimer);
+
   // Auto-hide after 3 seconds
-  setTimeout(() => {
+  statusTimer = setTimeout(() => {
     status.className = 'status';
+    statusTimer = null;
   }, 3000);
 }
