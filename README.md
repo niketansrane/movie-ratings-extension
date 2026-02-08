@@ -68,6 +68,8 @@ No badge = no rating data available for that title.
 movie-ratings-extension/
 ├── manifest.json                  # Chrome extension config (MV3)
 ├── package.json                   # Project metadata & scripts
+├── .editorconfig                  # Editor formatting rules
+├── .gitignore                     # Git ignore rules
 ├── LICENSE                        # MIT license
 ├── PRIVACY.md                     # Privacy policy
 │
@@ -89,7 +91,9 @@ movie-ratings-extension/
 │   ├── generate-icons.js          # Icon generator
 │   └── package.js                 # Build .zip for Chrome Web Store
 │
-├── assets/                        # Demo screenshots / videos
+├── assets/
+│   ├── demo.gif                   # Demo GIF for README
+│   └── demo.mp4                   # Demo video (full quality)
 └── docs/plans/                    # Feature planning docs
 ```
 
@@ -123,8 +127,10 @@ movie-ratings-extension/
 ## Scripts
 
 ```bash
-node scripts/generate-icons.js   # Regenerate extension icons
-node scripts/package.js           # Build .zip for Chrome Web Store upload
+npm run lint                      # Lint source files with ESLint
+npm run icons                     # Regenerate extension icons
+npm run zip                       # Build .zip for Chrome Web Store upload
+npm run clean                     # Remove dist/ folder
 ```
 
 ## Troubleshooting
